@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (Docker)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker container
+        run: docker compose build
+
+      - name: Start Docker dev environment
+        run: docker compose up -d
+
+      - name: Run cargo fmt --check
+        run: docker exec arkpkg-dev cargo fmt --check
+
+      - name: Run cargo clippy
+        run: docker exec arkpkg-dev cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run cargo test
+        run: docker exec arkpkg-dev cargo test --all-targets
+
+      - name: Build release binaries
+        run: docker exec arkpkg-dev cargo build --release
