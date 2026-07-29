@@ -1,0 +1,40 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "arkpkg"
+version = "1.0.0"
+edition = "2024"
+authors = ["arkanaOS Team"]
+description = "Official package manager for arkanaOS"
+license = "GPL-3.0"
+
+[lib]
+name = "arkpkg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arkpkg"
+path = "src/main.rs"
+
+[[bin]]
+name = "arkpkg-build"
+path = "src/bin/arkpkg-build.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tar = "0.4"
+lz4_flex = "0.11"
+sha2 = "0.10"
+walkdir = "2.5"
+tempfile = "3.10"
+chrono = "0.4"
+log = "0.4"
+simplelog = "0.12"
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

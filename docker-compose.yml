@@ -1,0 +1,12 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arkpkg-dev
+    volumes:
+      - .:/workspace/arkpkg
+    environment:
+      - ARKPKG_ROOT=/workspace/fake_root
+    working_dir: /workspace/arkpkg
+    command: tail -f /dev/null
