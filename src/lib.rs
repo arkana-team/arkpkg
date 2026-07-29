@@ -1,0 +1,13 @@
+pub mod archive;
+pub mod checksum;
+pub mod cli;
+pub mod database;
+pub mod errors;
+pub mod installer;
+pub mod logger;
+pub mod metadata;
+pub mod package;
+pub mod prompt;
+pub mod remover;
+pub mod verifier;
+pub mod version;

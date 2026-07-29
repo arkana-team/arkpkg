@@ -1,0 +1,7 @@
+Name: hello
+Description: Simple Hello World demonstration package
+Version: 1.0.0
+Arch: x86_64
+URL: https://arkanaos.org/packages/hello
+License: MIT
+Maintainer: arkanaOS Team
