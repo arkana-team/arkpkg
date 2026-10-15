@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 
 use crate::database::Database;
@@ -33,14 +34,22 @@ impl<'a> Verifier<'a> {
                 .root()
                 .join(file_rel.strip_prefix("/").unwrap_or(file_rel));
 
-            if !target_path.exists() {
-                println!("MISSING {}", file_rel.display());
-                results.push(VerifyStatus::Missing(file_rel.clone()));
-                failed = true;
-            } else {
-                // If file exists and is readable
-                println!("OK      {}", file_rel.display());
-                results.push(VerifyStatus::Ok(file_rel.clone()));
+            match fs::symlink_metadata(&target_path) {
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    println!("OK      {}", file_rel.display());
+                    results.push(VerifyStatus::Ok(file_rel.clone()));
+                }
+                Ok(_) => {
+                    println!("MISSING {}", file_rel.display());
+                    results.push(VerifyStatus::Missing(file_rel.clone()));
+                    failed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("MISSING {}", file_rel.display());
+                    results.push(VerifyStatus::Missing(file_rel.clone()));
+                    failed = true;
+                }
+                Err(error) => return Err(ArkError::Io(error)),
             }
         }
 
