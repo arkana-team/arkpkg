@@ -31,10 +31,14 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Install a package (.ark archive)
+    /// Install a package archive or package name from a repository
     Install {
-        /// Path to .ark package archive
-        package_file: PathBuf,
+        /// Path to a .ark archive or package name from a configured repository
+        package: String,
+
+        /// Restrict repository lookup to this configured repository
+        #[arg(long)]
+        repo: Option<String>,
     },
 
     /// Remove an installed package
@@ -58,9 +62,35 @@ pub enum Commands {
     /// List all installed packages
     List,
 
-    /// Search installed package names and descriptions
+    /// Search installed packages and configured repositories
     Search {
         /// Search query term
         query: String,
     },
+
+    /// Manage package repositories
+    Repo {
+        #[command(subcommand)]
+        command: RepositoryCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepositoryCommands {
+    /// Add an HTTPS repository base URL containing index.json
+    Add {
+        /// Repository name used by --repo
+        name: String,
+        /// HTTPS base URL, for example https://debarkak.github.io/arkpkg-repo
+        url: String,
+    },
+
+    /// Remove a configured repository
+    Remove {
+        /// Repository name
+        name: String,
+    },
+
+    /// List configured repositories
+    List,
 }
