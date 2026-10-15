@@ -81,7 +81,7 @@ pub enum RepositoryCommands {
     Add {
         /// Repository name used by --repo
         name: String,
-        /// HTTPS base URL, for example https://debarkak.github.io/arkpkg-repo
+        /// HTTPS base URL, for example https://arkana-team.github.io/arkpkg-repo
         url: String,
     },
 
