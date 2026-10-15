@@ -9,5 +9,6 @@ pub mod metadata;
 pub mod package;
 pub mod prompt;
 pub mod remover;
+pub mod repository;
 pub mod verifier;
 pub mod version;

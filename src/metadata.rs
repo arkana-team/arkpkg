@@ -53,6 +53,25 @@ pub struct Metadata {
     pub conflicts: Vec<String>,
 }
 
+pub(crate) fn validate_package_atom(value: &str, field: &str) -> Result<()> {
+    let valid = !value.is_empty()
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte));
+    if valid {
+        Ok(())
+    } else {
+        Err(ArkError::InvalidPackage(format!(
+            "Invalid {field} '{value}': use ASCII letters, digits, '.', '_', '+', and '-'"
+        )))
+    }
+}
+
+pub(crate) fn validate_package_name(name: &str) -> Result<()> {
+    validate_package_atom(name, "package name")
+}
+
 impl Metadata {
     /// Parses an `ARKPKG` plain text file content into a Metadata struct.
     pub fn parse(content: &str) -> Result<Self> {
@@ -118,6 +137,7 @@ impl Metadata {
                         if field_val.is_empty() {
                             return Err(ArkError::InvalidPackage("Empty Arch field".into()));
                         }
+                        validate_package_atom(field_val, "architecture")?;
                         arch = Some(field_val.to_string());
                         current_section = None;
                     }
@@ -213,6 +233,7 @@ impl Metadata {
         }
 
         let name = name.ok_or_else(|| ArkError::InvalidPackage("Missing field: Name".into()))?;
+        validate_package_name(&name)?;
         let description = description
             .ok_or_else(|| ArkError::InvalidPackage("Missing field: Description".into()))?;
         let version =
@@ -308,5 +329,13 @@ busybox-sh
         assert_eq!(meta.dependencies.len(), 2);
         assert_eq!(meta.provides.len(), 2);
         assert_eq!(meta.conflicts.len(), 2);
+    }
+
+    #[test]
+    fn rejects_package_names_that_could_escape_database_paths() {
+        for name in ["../outside", "a/b", "", ".hidden", "name with spaces"] {
+            let content = format!("Name: {name}\nDescription: test\nVersion: 1.0\nArch: any\n");
+            assert!(Metadata::parse(&content).is_err(), "accepted {name:?}");
+        }
     }
 }

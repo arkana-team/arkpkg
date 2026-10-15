@@ -3,13 +3,14 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 
-use arkpkg::cli::{Cli, Commands};
+use arkpkg::cli::{Cli, Commands, RepositoryCommands};
 use arkpkg::database::Database;
 use arkpkg::errors::Result;
 use arkpkg::installer::Installer;
 use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
 use arkpkg::remover::Remover;
+use arkpkg::repository::RepositoryManager;
 use arkpkg::verifier::Verifier;
 
 fn run() -> Result<()> {
@@ -22,6 +23,7 @@ fn run() -> Result<()> {
 
     let db = Database::new(&root_path);
     db.init()?;
+    let repositories = RepositoryManager::new(&root_path);
 
     let logger = Logger::new(&root_path);
     logger.init()?;
@@ -29,9 +31,15 @@ fn run() -> Result<()> {
     let prompt = PromptHandler::new(cli.auto_yes, cli.auto_no, cli.force);
 
     match cli.command {
-        Commands::Install { package_file } => {
+        Commands::Install { package, repo } => {
             let mut installer = Installer::new(&db, &logger, prompt);
-            installer.install(package_file)?;
+            let local_path = PathBuf::from(&package);
+            if local_path.is_file() {
+                installer.install(local_path)?;
+            } else {
+                let downloaded = repositories.download_package(&package, repo.as_deref())?;
+                installer.install(downloaded.path())?;
+            }
         }
         Commands::Remove { package_name } => {
             let mut remover = Remover::new(&db, &logger, prompt);
@@ -57,14 +65,35 @@ fn run() -> Result<()> {
             for (name, ver) in installed {
                 let name_matches = name.to_lowercase().contains(&query_lower);
                 if name_matches {
-                    println!("{}\n{}", name, ver);
-                } else if let Ok(info) = db.read_arkinfo(&name) {
-                    if info.name.to_lowercase().contains(&query_lower) {
-                        println!("{}\n{}", name, ver);
-                    }
+                    println!("{} {} [installed]", name, ver);
                 }
             }
+            for (repo_name, package) in repositories.search(&query, None)? {
+                println!(
+                    "{} {} [{}] ({}) - {}",
+                    package.name, package.version, package.arch, repo_name, package.description
+                );
+            }
         }
+        Commands::Repo { command } => match command {
+            RepositoryCommands::Add { name, url } => {
+                repositories.add(&name, &url)?;
+                println!(
+                    "Added repository '{}' ({})",
+                    name,
+                    url.trim_end_matches('/')
+                );
+            }
+            RepositoryCommands::Remove { name } => {
+                repositories.remove(&name)?;
+                println!("Removed repository '{}'", name);
+            }
+            RepositoryCommands::List => {
+                for repository in repositories.list()? {
+                    println!("{} {}", repository.name, repository.url);
+                }
+            }
+        },
     }
 
     Ok(())

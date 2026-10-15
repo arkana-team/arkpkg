@@ -43,6 +43,16 @@ impl Version {
         if s.is_empty() {
             return Err(ArkError::InvalidPackage("Empty version string".into()));
         }
+        if !s.as_bytes()[0].is_ascii_alphanumeric()
+            || !s
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        {
+            return Err(ArkError::InvalidPackage(format!(
+                "Invalid version string: {}",
+                s
+            )));
+        }
 
         let mut segments = Vec::new();
         for part in s.split(&['.', '-', '_'][..]) {
@@ -268,6 +278,9 @@ mod tests {
         assert_eq!(v1, v2);
         assert!(v1 > v3);
         assert!(v4 > v5); // 41 > 4
+        for invalid in ["../outside", "1/2", "1 0"] {
+            assert!(Version::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

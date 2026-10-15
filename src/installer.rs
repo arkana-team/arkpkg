@@ -1,5 +1,7 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
@@ -44,11 +46,7 @@ impl<'a> Installer<'a> {
         // 6. Ensure package architecture matches current system
         self.logger.info("Checking package architecture");
         let current_arch = std::env::consts::ARCH;
-        if metadata.arch != "any"
-            && metadata.arch != "all"
-            && metadata.arch != current_arch
-            && metadata.arch != "x86_64"
-        {
+        if metadata.arch != "any" && metadata.arch != "all" && metadata.arch != current_arch {
             return Err(ArkError::ArchitectureMismatch {
                 package_arch: metadata.arch.clone(),
                 system_arch: current_arch.to_string(),
@@ -64,6 +62,10 @@ impl<'a> Installer<'a> {
                     metadata.name, installed_ver
                 )));
             }
+            return Err(ArkError::PackageConflict(format!(
+                "Package '{}' is already installed at version {}; remove it before installing {}",
+                metadata.name, installed_ver, metadata.version
+            )));
         }
 
         // 8. Verify dependency requirements against installed packages and provides
@@ -72,7 +74,9 @@ impl<'a> Installer<'a> {
         for dep_req in &metadata.dependencies {
             let mut satisfied = false;
             for (inst_name, inst_ver) in &installed_pkgs {
-                if inst_name == &dep_req.name && dep_req.is_satisfied_by(inst_ver) {
+                if inst_name.eq_ignore_ascii_case(&dep_req.name)
+                    && dep_req.is_satisfied_by(inst_ver)
+                {
                     satisfied = true;
                     break;
                 }
@@ -108,18 +112,46 @@ impl<'a> Installer<'a> {
                     conflict
                 )));
             }
+            for (installed_name, _) in &installed_pkgs {
+                match self.db.read_arkinfo(installed_name) {
+                    Ok(installed_info)
+                        if installed_info
+                            .provides
+                            .iter()
+                            .any(|provide| provide.name.eq_ignore_ascii_case(conflict)) =>
+                    {
+                        return Err(ArkError::PackageConflict(format!(
+                            "Conflicts with '{}' provided by installed package '{}'",
+                            conflict, installed_name
+                        )));
+                    }
+                    _ => {}
+                }
+            }
         }
-
-        // Check if any installed package's conflicts list contains this package name or provides
-        for (inst_name, _) in &installed_pkgs {
-            if let Ok(inst_arkinfo) = self.db.read_arkinfo(inst_name) {
-                // If installed package conflicts with metadata.name
-                if inst_arkinfo
-                    .provides
+        for (installed_name, _) in &installed_pkgs {
+            if let Ok(installed_info) = self.db.read_arkinfo(installed_name) {
+                if installed_info
+                    .conflicts
                     .iter()
-                    .any(|p| p.name == metadata.name)
+                    .any(|conflict| conflict.eq_ignore_ascii_case(&metadata.name))
                 {
-                    // Compatible or handled via provides
+                    return Err(ArkError::PackageConflict(format!(
+                        "Installed package '{}' conflicts with '{}'",
+                        installed_name, metadata.name
+                    )));
+                }
+                for provide in &metadata.provides {
+                    if installed_info
+                        .conflicts
+                        .iter()
+                        .any(|conflict| conflict.eq_ignore_ascii_case(&provide.name))
+                    {
+                        return Err(ArkError::PackageConflict(format!(
+                            "Installed package '{}' conflicts with '{}' provided by '{}'",
+                            installed_name, provide.name, metadata.name
+                        )));
+                    }
                 }
             }
         }
@@ -132,16 +164,26 @@ impl<'a> Installer<'a> {
         let mut files_to_install = Vec::new();
         let mut conflicts_to_prompt = Vec::new();
 
-        for entry in WalkDir::new(&pkg_files_root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(&pkg_files_root).sort_by_file_name() {
+            let entry = entry.map_err(|error| {
+                ArkError::Generic(format!("Could not inspect package files: {error}"))
+            })?;
             let relative = entry
                 .path()
                 .strip_prefix(&pkg_files_root)
-                .unwrap_or(entry.path());
+                .map_err(|error| ArkError::Generic(format!("Invalid package path: {error}")))?;
             if relative.as_os_str().is_empty() {
                 continue;
+            }
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Unsafe package file path '{}'",
+                    relative.display()
+                )));
             }
 
             let target_path = self.db.root().join(relative);
@@ -150,10 +192,14 @@ impl<'a> Installer<'a> {
                 files_to_install.push((entry.path().to_path_buf(), relative.to_path_buf()));
 
                 let install_rel_path = PathBuf::from("/").join(relative);
-                if target_path.exists() {
+                if path_exists(&target_path)? {
                     if let Some(owner) = file_ownership.get(&install_rel_path) {
                         if owner != &metadata.name {
-                            conflicts_to_prompt.push((install_rel_path.clone(), owner.clone()));
+                            return Err(ArkError::PackageConflict(format!(
+                                "File '{}' is already owned by package '{}'",
+                                install_rel_path.display(),
+                                owner
+                            )));
                         }
                     } else {
                         conflicts_to_prompt
@@ -174,37 +220,44 @@ impl<'a> Installer<'a> {
             }
         }
 
-        // 12. Copy files into installation root (with rollback tracking)
+        // 12. Install files with backups so failures preserve overwritten files.
         self.logger.info("Copying files into installation root");
-        let mut copied_files = Vec::new();
+        let pkg_checksum = compute_sha256_file(ark_path)?;
+        let mut file_changes: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         let mut installed_rel_files = Vec::new();
 
         for (src_path, rel_path) in &files_to_install {
             let dest_path = self.db.root().join(rel_path);
-
             if let Some(parent) = dest_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    self.rollback(&copied_files);
-                    return Err(ArkError::Io(e));
+                if let Err(error) = fs::create_dir_all(parent) {
+                    self.rollback(&file_changes);
+                    return Err(ArkError::Io(error));
+                }
+                if let Err(error) = validate_destination_parent(self.db.root(), parent) {
+                    self.rollback(&file_changes);
+                    return Err(error);
                 }
             }
 
+            let backup = match backup_existing_file(&dest_path) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    self.rollback(&file_changes);
+                    return Err(error);
+                }
+            };
+            file_changes.push((dest_path.clone(), backup));
             self.logger
                 .action("COPY", &format!("/{}", rel_path.display()));
 
-            if let Err(e) = fs::copy(src_path, &dest_path) {
-                self.rollback(&copied_files);
-                return Err(ArkError::Io(e));
+            if let Err(error) = install_package_file(src_path, &dest_path, rel_path) {
+                self.rollback(&file_changes);
+                return Err(error);
             }
-
-            copied_files.push(dest_path);
             installed_rel_files.push(PathBuf::from("/").join(rel_path));
         }
 
-        // 13. Calculate SHA-256 checksum of the package archive
-        let pkg_checksum = compute_sha256_file(ark_path).unwrap_or_default();
-
-        // 14. Generate .arkinfo file
+        // 13. Generate .arkinfo file
         self.logger.info("Writing package info metadata (.arkinfo)");
         let arkinfo = ArkInfo {
             name: metadata.name.clone(),
@@ -213,49 +266,145 @@ impl<'a> Installer<'a> {
             installed_at: chrono::Utc::now().to_rfc3339(),
             checksum: pkg_checksum,
             files: installed_rel_files.clone(),
+            dependencies: metadata.dependencies.clone(),
             provides: metadata.provides.clone(),
+            conflicts: metadata.conflicts.clone(),
         };
 
-        if let Err(e) = self.db.write_arkinfo(&arkinfo) {
-            self.rollback(&copied_files);
-            return Err(e);
+        if let Err(error) = self.db.write_arkinfo(&arkinfo) {
+            self.rollback(&file_changes);
+            return Err(error);
         }
 
-        // 15. Update package.db
+        // 14. Update package.db
         self.logger.info("Updating package database (package.db)");
-        if let Err(e) = self
+        if let Err(error) = self
             .db
             .add_installed_package(&metadata.name, &metadata.version)
         {
-            self.rollback(&copied_files);
+            self.rollback(&file_changes);
             let _ = self.db.remove_arkinfo(&metadata.name);
-            return Err(e);
+            return Err(error);
         }
 
-        // 16. Update file.db
+        // 15. Update file.db
         self.logger.info("Updating file database (file.db)");
-        if let Err(e) = self
+        if let Err(error) = self
             .db
             .add_file_ownership(&installed_rel_files, &metadata.name)
         {
-            // rollback
-            self.rollback(&copied_files);
+            self.rollback(&file_changes);
             let _ = self.db.remove_arkinfo(&metadata.name);
             let _ = self.db.remove_installed_package(&metadata.name);
-            return Err(e);
+            return Err(error);
         }
 
-        // 17 & 18. Write log and report success
+        for (_, backup) in &file_changes {
+            if let Some(path) = backup {
+                let _ = fs::remove_file(path);
+            }
+        }
         self.logger.info("DONE");
         Ok(())
     }
 
-    /// Rollback copied files if installation fails midway.
-    fn rollback(&self, copied_files: &[PathBuf]) {
-        for file in copied_files {
-            if file.exists() {
-                let _ = fs::remove_file(file);
+    /// Restore pre-existing files and remove files from a failed installation.
+    fn rollback(&self, file_changes: &[(PathBuf, Option<PathBuf>)]) {
+        for (path, backup) in file_changes.iter().rev() {
+            if path_exists(path).unwrap_or(false) {
+                let _ = fs::remove_file(path);
+            }
+            if let Some(backup_path) = backup {
+                let _ = fs::rename(backup_path, path);
             }
         }
     }
+}
+
+fn path_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_destination_parent(root: &Path, parent: &Path) -> Result<()> {
+    let canonical_root = root.canonicalize()?;
+    let canonical_parent = parent.canonicalize()?;
+    if canonical_parent.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(ArkError::InvalidPackage(format!(
+            "Install destination '{}' resolves outside target root '{}'",
+            canonical_parent.display(),
+            canonical_root.display()
+        )))
+    }
+}
+
+fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ArkError::Io(error)),
+    };
+    if metadata.file_type().is_dir() {
+        return Err(ArkError::PackageConflict(format!(
+            "Cannot replace directory '{}' with a package file",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| ArkError::InvalidPackage("Install path has no parent directory".into()))?;
+    let temporary = NamedTempFile::new_in(parent)?;
+    fs::rename(path, temporary.path())?;
+    let (_, backup_path) = temporary
+        .keep()
+        .map_err(|error| ArkError::Io(error.error))?;
+    Ok(Some(backup_path))
+}
+
+fn safe_symlink_target(link_path: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return target
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+    }
+
+    let mut depth = link_path
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::CurDir => {}
+        }
+    }
+    true
+}
+
+fn install_package_file(source: &Path, destination: &Path, relative: &Path) -> Result<()> {
+    if fs::symlink_metadata(source)?.file_type().is_symlink() {
+        let target = fs::read_link(source)?;
+        if !safe_symlink_target(relative, &target) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Symlink '{}' points outside the package root",
+                relative.display()
+            )));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, destination)?;
+        #[cfg(not(unix))]
+        return Err(ArkError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "package symlinks require a Unix host",
+        )));
+    } else {
+        fs::copy(source, destination)?;
+    }
+    Ok(())
 }

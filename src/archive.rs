@@ -1,6 +1,7 @@
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder};
 
 use crate::errors::{ArkError, Result};
@@ -26,19 +27,93 @@ pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut tar_archive = Archive::new(lz4_decoder);
 
     fs::create_dir_all(dest_dir)?;
-    tar_archive
-        .unpack(dest_dir)
-        .map_err(|e| ArkError::InvalidPackage(format!("Failed to extract archive: {}", e)))?;
+    let entries = tar_archive
+        .entries()
+        .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
+    let mut symlink_paths = HashSet::new();
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            ArkError::InvalidPackage(format!("Invalid package archive: {error}"))
+        })?;
+        let path = entry
+            .path()
+            .map_err(|error| ArkError::InvalidPackage(format!("Invalid archive path: {error}")))?
+            .into_owned();
+        let safe_relative_path = !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)));
+        let allowed_root = path == Path::new("ARKPKG") || path.starts_with("package");
+        if !safe_relative_path || !allowed_root {
+            return Err(ArkError::InvalidPackage(format!(
+                "Unsafe or unexpected archive path '{}'",
+                path.display()
+            )));
+        }
+        if symlink_paths
+            .iter()
+            .any(|symlink: &PathBuf| path != *symlink && path.starts_with(symlink))
+        {
+            return Err(ArkError::InvalidPackage(format!(
+                "Archive entry '{}' descends through a symlink",
+                path.display()
+            )));
+        }
+        let entry_type = entry.header().entry_type();
+        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Unsupported archive entry type at '{}'",
+                path.display()
+            )));
+        }
+        if path == Path::new("ARKPKG") && !entry_type.is_file() {
+            return Err(ArkError::InvalidPackage(
+                "Archive metadata entry must be a regular file".into(),
+            ));
+        }
+        if path == Path::new("package") && !entry_type.is_dir() {
+            return Err(ArkError::InvalidPackage(
+                "Archive package root must be a directory".into(),
+            ));
+        }
+        if entry_type.is_symlink() {
+            let target = entry
+                .link_name()
+                .map_err(|error| {
+                    ArkError::InvalidPackage(format!("Invalid symlink target: {error}"))
+                })?
+                .ok_or_else(|| {
+                    ArkError::InvalidPackage("Archive symlink is missing its target".into())
+                })?;
+            if !safe_archive_symlink_target(&path, &target) {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Symlink '{}' points outside package contents",
+                    path.display()
+                )));
+            }
+            symlink_paths.insert(path.clone());
+        }
+        let extracted = entry.unpack_in(dest_dir).map_err(|error| {
+            ArkError::InvalidPackage(format!("Failed to extract archive: {error}"))
+        })?;
+        if !extracted {
+            return Err(ArkError::InvalidPackage(format!(
+                "Archive entry '{}' escaped the extraction directory",
+                path.display()
+            )));
+        }
+    }
 
     let metadata_path = dest_dir.join("ARKPKG");
-    if !metadata_path.exists() {
+    if !metadata_path.is_file() {
         return Err(ArkError::InvalidPackage(
             "Archive missing root 'ARKPKG' metadata file".into(),
         ));
     }
 
     let pkg_dir = dest_dir.join("package");
-    if !pkg_dir.exists() {
+    if !pkg_dir.is_dir() {
         return Err(ArkError::InvalidPackage(
             "Archive missing 'package/' directory".into(),
         ));
@@ -46,6 +121,30 @@ pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let meta_content = fs::read_to_string(metadata_path)?;
     Metadata::parse(&meta_content)
+}
+
+fn safe_archive_symlink_target(link_path: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return target
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+    }
+    let relative_link = match link_path.strip_prefix("package") {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let mut depth = relative_link
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::CurDir => {}
+        }
+    }
+    true
 }
 
 /// Packs a package directory (containing `ARKPKG` and `package/`) into an `.ark` (`tar.lz4`) package.
@@ -73,15 +172,17 @@ pub fn create_ark<P: AsRef<Path>, Q: AsRef<Path>>(source_dir: P, output_ark_path
     let meta_content = fs::read_to_string(&metadata_path)?;
     let _metadata = Metadata::parse(&meta_content)?;
 
-    if let Some(parent) = output_ark_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output_ark_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let output_file = File::create(output_ark_path)?;
     let lz4_encoder = FrameEncoder::new(output_file);
     let mut tar_builder = Builder::new(lz4_encoder);
+    tar_builder.follow_symlinks(false);
 
     // Add ARKPKG file
     tar_builder
@@ -136,5 +237,36 @@ Arch: x86_64
         assert_eq!(meta.name, "hello");
         assert_eq!(meta.version.as_str(), "1.0.0");
         assert!(dest_dir.path().join("package/usr/bin/hello").exists());
+    }
+
+    #[test]
+    fn rejects_archive_paths_that_escape_the_extraction_root() {
+        let archive_dir = TempDir::new().unwrap();
+        let extraction_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("unsafe.ark");
+
+        let output = File::create(&archive_path).unwrap();
+        let encoder = FrameEncoder::new(output);
+        let mut tar_builder = Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("safe-entry").unwrap();
+        header.as_mut_bytes()[..11].copy_from_slice(b"../outside\0");
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder.append(&header, &b"x"[..]).unwrap();
+        let encoder = tar_builder.into_inner().unwrap();
+        encoder.finish().unwrap();
+
+        assert!(extract_ark(&archive_path, extraction_dir.path()).is_err());
+        assert!(
+            !extraction_dir
+                .path()
+                .parent()
+                .unwrap()
+                .join("outside")
+                .exists()
+        );
     }
 }
