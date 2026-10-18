@@ -28,6 +28,30 @@ impl<'a> Verifier<'a> {
         let mut results = Vec::new();
         let mut failed = false;
 
+        for (_, backup_rel) in &arkinfo.preserved_files {
+            let backup_path = self
+                .db
+                .root()
+                .join(backup_rel.strip_prefix("/").unwrap_or(backup_rel));
+            match fs::symlink_metadata(&backup_path) {
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    println!("OK      preserved original {}", backup_rel.display());
+                    results.push(VerifyStatus::Ok(backup_rel.clone()));
+                }
+                Ok(_) => {
+                    println!("MISSING preserved original {}", backup_rel.display());
+                    results.push(VerifyStatus::Missing(backup_rel.clone()));
+                    failed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("MISSING preserved original {}", backup_rel.display());
+                    results.push(VerifyStatus::Missing(backup_rel.clone()));
+                    failed = true;
+                }
+                Err(error) => return Err(ArkError::Io(error)),
+            }
+        }
+
         for file_rel in &arkinfo.files {
             let target_path = self
                 .db

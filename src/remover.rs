@@ -65,6 +65,8 @@ impl<'a> Remover<'a> {
             return Err(ArkError::UserCancelled);
         }
 
+        let preserved_files = resolve_preserved_files(self.db.root(), &arkinfo)?;
+
         // Delete every file listed in .arkinfo
         let protected_dirs: HashSet<PathBuf> = [
             "/usr",
@@ -124,22 +126,59 @@ impl<'a> Remover<'a> {
             }
         }
 
+        let mut restored_preserved_files = Vec::new();
+        for (original, backup) in &preserved_files {
+            match fs::symlink_metadata(original) {
+                Ok(_) => {
+                    rollback_files(&restored_preserved_files, &removed_files)?;
+                    return Err(ArkError::PackageConflict(format!(
+                        "Cannot restore pre-install file '{}' because the path is occupied",
+                        original.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    rollback_files(&restored_preserved_files, &removed_files)?;
+                    return Err(ArkError::Io(error));
+                }
+            }
+            if let Err(error) = fs::rename(backup, original) {
+                rollback_files(&restored_preserved_files, &removed_files)?;
+                return Err(ArkError::Io(error));
+            }
+            restored_preserved_files.push((original.clone(), backup.clone()));
+        }
+
         // Remove database records only after all package files have been staged for deletion.
         self.logger.info("Updating package.db");
         if let Err(error) = self.db.remove_installed_package(pkg_name) {
-            restore_removed_files(&removed_files)?;
+            rollback_files(&restored_preserved_files, &removed_files)?;
             return Err(error);
         }
 
         self.logger.info("Updating file.db");
         if let Err(error) = self.db.remove_file_ownership(&arkinfo.files) {
-            self.restore_database_and_files(pkg_name, &arkinfo, &removed_files, true, false)?;
+            self.restore_database_and_files(
+                pkg_name,
+                &arkinfo,
+                &removed_files,
+                &restored_preserved_files,
+                true,
+                false,
+            )?;
             return Err(error);
         }
 
         self.logger.info("Deleting .arkinfo metadata file");
         if let Err(error) = self.db.remove_arkinfo(pkg_name) {
-            self.restore_database_and_files(pkg_name, &arkinfo, &removed_files, true, true)?;
+            self.restore_database_and_files(
+                pkg_name,
+                &arkinfo,
+                &removed_files,
+                &restored_preserved_files,
+                true,
+                true,
+            )?;
             return Err(error);
         }
 
@@ -185,6 +224,7 @@ impl<'a> Remover<'a> {
         pkg_name: &str,
         arkinfo: &crate::database::ArkInfo,
         removed_files: &[(PathBuf, PathBuf)],
+        restored_preserved_files: &[(PathBuf, PathBuf)],
         restore_package: bool,
         restore_ownership: bool,
     ) -> Result<()> {
@@ -202,8 +242,53 @@ impl<'a> Remover<'a> {
                     ArkError::Generic(format!("Failed to restore package record: {error}"))
                 })?;
         }
-        restore_removed_files(removed_files)
+        rollback_files(restored_preserved_files, removed_files)
     }
+}
+
+fn resolve_preserved_files(
+    root: &Path,
+    arkinfo: &crate::database::ArkInfo,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let canonical_root = root.canonicalize()?;
+    let mut resolved = Vec::with_capacity(arkinfo.preserved_files.len());
+    for (original, backup) in &arkinfo.preserved_files {
+        let original_path = root.join(original.strip_prefix("/").map_err(|_| {
+            ArkError::InvalidPackage(format!("Invalid preserved path '{}'", original.display()))
+        })?);
+        let backup_path = root.join(backup.strip_prefix("/").map_err(|_| {
+            ArkError::InvalidPackage(format!("Invalid preserved backup '{}'", backup.display()))
+        })?);
+        let parent = original_path.parent().ok_or_else(|| {
+            ArkError::InvalidPackage("Preserved path has no parent directory".into())
+        })?;
+        let canonical_parent = parent.canonicalize()?;
+        if !canonical_parent.starts_with(&canonical_root) || backup_path.parent() != Some(parent) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Preserved backup '{}' is outside the target root",
+                backup.display()
+            )));
+        }
+        let backup_metadata = fs::symlink_metadata(&backup_path)?;
+        if !(backup_metadata.is_file() || backup_metadata.file_type().is_symlink()) {
+            return Err(ArkError::PackageConflict(format!(
+                "Preserved backup '{}' is not a file",
+                backup.display()
+            )));
+        }
+        resolved.push((original_path, backup_path));
+    }
+    Ok(resolved)
+}
+
+fn rollback_files(
+    restored_preserved_files: &[(PathBuf, PathBuf)],
+    removed_files: &[(PathBuf, PathBuf)],
+) -> Result<()> {
+    for (original, backup) in restored_preserved_files.iter().rev() {
+        fs::rename(original, backup)?;
+    }
+    restore_removed_files(removed_files)
 }
 
 fn backup_installed_file(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
