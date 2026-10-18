@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ pub struct ArkInfo {
     pub dependencies: Vec<DependencyReq>,
     pub provides: Vec<ProvideItem>,
     pub conflicts: Vec<String>,
+    /// Files that existed before installation, recorded as (installed path, backup path).
+    pub preserved_files: Vec<(PathBuf, PathBuf)>,
 }
 
 impl ArkInfo {
@@ -34,6 +36,7 @@ impl ArkInfo {
         let mut dependencies = Vec::new();
         let mut provides = Vec::new();
         let mut conflicts = Vec::new();
+        let mut preserved_files = Vec::new();
 
         let mut current_section: Option<&str> = None;
 
@@ -92,6 +95,12 @@ impl ArkInfo {
                             conflicts.push(v.to_string());
                         }
                     }
+                    "PreservedFiles" => {
+                        current_section = Some("PreservedFiles");
+                        if !v.is_empty() {
+                            preserved_files.push(parse_preserved_file(v)?);
+                        }
+                    }
                     _ => {
                         if let Some(sec) = current_section {
                             match sec {
@@ -99,6 +108,9 @@ impl ArkInfo {
                                 "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
                                 "Provides" => provides.push(ProvideItem::parse(trimmed)?),
                                 "Conflicts" => conflicts.push(trimmed.to_string()),
+                                "PreservedFiles" => {
+                                    preserved_files.push(parse_preserved_file(trimmed)?)
+                                }
                                 _ => {}
                             }
                         }
@@ -110,6 +122,7 @@ impl ArkInfo {
                     "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
                     "Provides" => provides.push(ProvideItem::parse(trimmed)?),
                     "Conflicts" => conflicts.push(trimmed.to_string()),
+                    "PreservedFiles" => preserved_files.push(parse_preserved_file(trimmed)?),
                     _ => {}
                 }
             }
@@ -124,6 +137,7 @@ impl ArkInfo {
         for path in &files {
             validate_installed_path(path)?;
         }
+        validate_preserved_files(&files, &preserved_files)?;
         for dependency in &dependencies {
             validate_package_name(&dependency.name)?;
         }
@@ -143,6 +157,7 @@ impl ArkInfo {
             dependencies,
             provides,
             conflicts,
+            preserved_files,
         })
     }
 
@@ -158,6 +173,13 @@ impl ArkInfo {
         out.push_str("Files:\n");
         for f in &self.files {
             out.push_str(&format!("{}\n", f.display()));
+        }
+
+        if !self.preserved_files.is_empty() {
+            out.push_str("PreservedFiles:\n");
+            for (original, backup) in &self.preserved_files {
+                out.push_str(&format!("{}={}\n", original.display(), backup.display()));
+            }
         }
 
         if !self.dependencies.is_empty() {
@@ -202,6 +224,45 @@ fn validate_installed_path(path: &Path) -> Result<()> {
             "Unsafe installed file path '{}'",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+fn parse_preserved_file(value: &str) -> Result<(PathBuf, PathBuf)> {
+    let (original, backup) = value
+        .split_once('=')
+        .ok_or_else(|| ArkError::InvalidPackage("Malformed PreservedFiles entry".into()))?;
+    Ok((PathBuf::from(original), PathBuf::from(backup)))
+}
+
+fn validate_preserved_files(
+    files: &[PathBuf],
+    preserved_files: &[(PathBuf, PathBuf)],
+) -> Result<()> {
+    let mut originals = HashSet::new();
+    let mut backups = HashSet::new();
+    for (original, backup) in preserved_files {
+        validate_installed_path(original)?;
+        validate_installed_path(backup)?;
+        if !files.contains(original) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Preserved path '{}' is not owned by this package",
+                original.display()
+            )));
+        }
+        if original == backup || original.parent() != backup.parent() {
+            return Err(ArkError::InvalidPackage(format!(
+                "Backup '{}' must be a sibling of preserved path '{}'",
+                backup.display(),
+                original.display()
+            )));
+        }
+        if files.contains(backup) || !originals.insert(original) || !backups.insert(backup) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Duplicate or conflicting preserved path '{}'",
+                original.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -491,6 +552,10 @@ mod tests {
             dependencies: vec![DependencyReq::parse("glibc>=2.39").unwrap()],
             provides: vec![],
             conflicts: vec!["busybox".into()],
+            preserved_files: vec![(
+                PathBuf::from("/usr/bin/bash"),
+                PathBuf::from("/usr/bin/.tmp-original-bash"),
+            )],
         };
 
         db.write_arkinfo(&arkinfo).unwrap();
@@ -499,6 +564,14 @@ mod tests {
         assert_eq!(loaded.files, vec![file_path]);
         assert_eq!(loaded.dependencies, arkinfo.dependencies);
         assert_eq!(loaded.conflicts, arkinfo.conflicts);
+        assert_eq!(loaded.preserved_files, arkinfo.preserved_files);
+    }
+
+    #[test]
+    fn old_arkinfo_without_preserved_files_remains_readable() {
+        let arkinfo =
+            ArkInfo::parse("Name: sample\nVersion: 1.0.0\nFiles:\n/usr/bin/sample\n").unwrap();
+        assert!(arkinfo.preserved_files.is_empty());
     }
 
     #[test]
@@ -511,6 +584,18 @@ mod tests {
         ] {
             let content = format!("Name: sample\nVersion: 1.0\nFiles:\n{path}\n");
             assert!(ArkInfo::parse(&content).is_err(), "accepted {path:?}");
+        }
+
+        let invalid_preserved = [
+            "/usr/bin/other=/usr/bin/.tmp-backup",
+            "/usr/bin/tool=/var/tmp/.tmp-backup",
+            "/usr/bin/tool=/usr/bin/tool",
+        ];
+        for entry in invalid_preserved {
+            let content = format!(
+                "Name: sample\nVersion: 1.0\nFiles:\n/usr/bin/tool\nPreservedFiles:\n{entry}\n"
+            );
+            assert!(ArkInfo::parse(&content).is_err(), "accepted {entry:?}");
         }
 
         let root = TempDir::new().unwrap();

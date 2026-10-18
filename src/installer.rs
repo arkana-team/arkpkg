@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -219,12 +220,18 @@ impl<'a> Installer<'a> {
                 return Err(ArkError::UserCancelled);
             }
         }
+        let untracked_conflicts: HashSet<PathBuf> = conflicts_to_prompt
+            .iter()
+            .filter(|(_, owner)| owner == "untracked")
+            .map(|(path, _)| path.clone())
+            .collect();
 
         // 12. Install files with backups so failures preserve overwritten files.
         self.logger.info("Copying files into installation root");
         let pkg_checksum = compute_sha256_file(ark_path)?;
         let mut file_changes: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         let mut installed_rel_files = Vec::new();
+        let mut preserved_files = Vec::new();
 
         for (src_path, rel_path) in &files_to_install {
             let dest_path = self.db.root().join(rel_path);
@@ -246,7 +253,22 @@ impl<'a> Installer<'a> {
                     return Err(error);
                 }
             };
-            file_changes.push((dest_path.clone(), backup));
+            file_changes.push((dest_path.clone(), backup.clone()));
+            let install_rel_path = PathBuf::from("/").join(rel_path);
+            if let Some(backup_path) = backup.as_ref()
+                && untracked_conflicts.contains(&install_rel_path)
+            {
+                let backup_rel_path = match backup_path.strip_prefix(self.db.root()) {
+                    Ok(path) => PathBuf::from("/").join(path),
+                    Err(error) => {
+                        self.rollback(&file_changes);
+                        return Err(ArkError::Generic(format!(
+                            "Could not record overwritten file backup: {error}"
+                        )));
+                    }
+                };
+                preserved_files.push((install_rel_path, backup_rel_path));
+            }
             self.logger
                 .action("COPY", &format!("/{}", rel_path.display()));
 
@@ -269,6 +291,7 @@ impl<'a> Installer<'a> {
             dependencies: metadata.dependencies.clone(),
             provides: metadata.provides.clone(),
             conflicts: metadata.conflicts.clone(),
+            preserved_files: preserved_files.clone(),
         };
 
         if let Err(error) = self.db.write_arkinfo(&arkinfo) {
@@ -299,8 +322,18 @@ impl<'a> Installer<'a> {
             return Err(error);
         }
 
+        let preserved_backup_paths: HashSet<PathBuf> = preserved_files
+            .iter()
+            .map(|(_, backup)| {
+                self.db
+                    .root()
+                    .join(backup.strip_prefix("/").unwrap_or(backup))
+            })
+            .collect();
         for (_, backup) in &file_changes {
-            if let Some(path) = backup {
+            if let Some(path) = backup
+                && !preserved_backup_paths.contains(path)
+            {
                 let _ = fs::remove_file(path);
             }
         }

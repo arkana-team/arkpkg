@@ -137,6 +137,86 @@ fn failed_install_restores_preexisting_files() {
     assert_eq!(db.is_installed("rollbacktest").unwrap(), None);
 }
 
+#[test]
+fn removing_package_restores_untracked_file_replaced_during_install() {
+    let pkg_source_dir = TempDir::new().unwrap();
+    let fake_root_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    fs::write(
+        pkg_source_dir.path().join("ARKPKG"),
+        "Name: replacement\nDescription: restore overwritten base file\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    let payload = pkg_source_dir.path().join("package/usr/bin/tool");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"package version").unwrap();
+
+    let installed = fake_root_dir.path().join("usr/bin/tool");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::write(&installed, b"original base version").unwrap();
+    let archive = output_dir.path().join("replacement.ark");
+    create_ark(pkg_source_dir.path(), &archive).unwrap();
+
+    let db = Database::new(fake_root_dir.path());
+    let logger = Logger::new(fake_root_dir.path());
+    logger.init().unwrap();
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"package version");
+
+    let arkinfo = db.read_arkinfo("replacement").unwrap();
+    assert_eq!(arkinfo.preserved_files.len(), 1);
+    assert!(Verifier::new(&db).verify("replacement").is_ok());
+    let (original, backup) = &arkinfo.preserved_files[0];
+    assert_eq!(original, &PathBuf::from("/usr/bin/tool"));
+    let backup_path = fake_root_dir.path().join(backup.strip_prefix("/").unwrap());
+    assert!(backup_path.exists());
+
+    let mut remover = Remover::new(&db, &logger, PromptHandler::new(true, false, false));
+    remover.remove("replacement").unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"original base version");
+    assert!(!backup_path.exists());
+    assert_eq!(db.is_installed("replacement").unwrap(), None);
+}
+
+#[test]
+fn remover_keeps_package_installed_when_preserved_backup_is_missing() {
+    let pkg_source_dir = TempDir::new().unwrap();
+    let fake_root_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    fs::write(
+        pkg_source_dir.path().join("ARKPKG"),
+        "Name: backupcheck\nDescription: detect missing preserved original\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    let payload = pkg_source_dir.path().join("package/usr/bin/tool");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"package version").unwrap();
+
+    let installed = fake_root_dir.path().join("usr/bin/tool");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::write(&installed, b"original base version").unwrap();
+    let archive = output_dir.path().join("backupcheck.ark");
+    create_ark(pkg_source_dir.path(), &archive).unwrap();
+
+    let db = Database::new(fake_root_dir.path());
+    let logger = Logger::new(fake_root_dir.path());
+    logger.init().unwrap();
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    let arkinfo = db.read_arkinfo("backupcheck").unwrap();
+    let backup = &arkinfo.preserved_files[0].1;
+    let backup_path = fake_root_dir.path().join(backup.strip_prefix("/").unwrap());
+    fs::remove_file(backup_path).unwrap();
+    assert!(Verifier::new(&db).verify("backupcheck").is_err());
+
+    let mut remover = Remover::new(&db, &logger, PromptHandler::new(true, false, false));
+    assert!(remover.remove("backupcheck").is_err());
+    assert!(db.is_installed("backupcheck").unwrap().is_some());
+    assert_eq!(fs::read(&installed).unwrap(), b"package version");
+}
+
 #[cfg(unix)]
 #[test]
 fn installer_preserves_safe_package_symlinks() {
