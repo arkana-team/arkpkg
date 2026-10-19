@@ -9,6 +9,7 @@ use crate::errors::{ArkError, Result};
 enum VersionSegment {
     Number(u64),
     Str(String),
+    Tilde,
 }
 
 impl PartialOrd for VersionSegment {
@@ -20,6 +21,9 @@ impl PartialOrd for VersionSegment {
 impl Ord for VersionSegment {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
+            (VersionSegment::Tilde, VersionSegment::Tilde) => Ordering::Equal,
+            (VersionSegment::Tilde, _) => Ordering::Less,
+            (_, VersionSegment::Tilde) => Ordering::Greater,
             (VersionSegment::Number(a), VersionSegment::Number(b)) => a.cmp(b),
             (VersionSegment::Str(a), VersionSegment::Str(b)) => a.cmp(b),
             // Numbers are considered greater than alphanumeric strings (e.g. 1 > alpha)
@@ -66,7 +70,7 @@ impl Version {
         if !version.as_bytes()[0].is_ascii_alphanumeric()
             || !version
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-~".contains(&byte))
         {
             return Err(ArkError::InvalidPackage(format!(
                 "Invalid version string: {}",
@@ -75,14 +79,19 @@ impl Version {
         }
 
         let mut segments = Vec::new();
-        for part in version.split(&['.', '-', '_'][..]) {
-            if part.is_empty() {
-                continue;
+        for (index, tilde_part) in version.split('~').enumerate() {
+            if index > 0 {
+                segments.push(VersionSegment::Tilde);
             }
-            if let Ok(num) = part.parse::<u64>() {
-                segments.push(VersionSegment::Number(num));
-            } else {
-                segments.push(VersionSegment::Str(part.to_string()));
+            for part in tilde_part.split(&['.', '-', '_'][..]) {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Ok(num) = part.parse::<u64>() {
+                    segments.push(VersionSegment::Number(num));
+                } else {
+                    segments.push(VersionSegment::Str(part.to_string()));
+                }
             }
         }
 
@@ -133,6 +142,8 @@ impl Ord for Version {
             let seg2 = other.segments.get(i);
 
             match (seg1, seg2) {
+                (Some(VersionSegment::Tilde), None) => return Ordering::Less,
+                (None, Some(VersionSegment::Tilde)) => return Ordering::Greater,
                 (Some(s1), Some(s2)) => {
                     let ord = s1.cmp(s2);
                     if ord != Ordering::Equal {
@@ -315,6 +326,19 @@ mod tests {
         for invalid in ["../outside", "1/2", "1 0", ":1", "1:", "a:1", "1:2:3"] {
             assert!(Version::parse(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn test_tilde_versions_sort_before_the_release() {
+        let prerelease = Version::parse("1.9.22~dfsg-4").unwrap();
+        let release = Version::parse("1.9.22").unwrap();
+        assert!(prerelease < release);
+        assert!(release > prerelease);
+
+        let epoch_prerelease = Version::parse("1:1.9.22~rc1").unwrap();
+        let epoch_release = Version::parse("1:1.9.22").unwrap();
+        assert!(epoch_prerelease < epoch_release);
+        assert!(Version::parse("2:1.9.22~rc1").unwrap() > epoch_release);
     }
 
     #[test]
