@@ -36,6 +36,9 @@ pub struct RepositoryPackage {
     #[serde(default)]
     pub description: String,
     pub file: String,
+    /// Optional absolute HTTPS URL for repositories hosted separately from their index.
+    #[serde(default)]
+    pub download_url: Option<String>,
     pub sha256: String,
 }
 
@@ -197,7 +200,10 @@ impl RepositoryManager {
             ))
         })?;
 
-        let package_url = format!("{}/{}", config.url.trim_end_matches('/'), package.file);
+        let package_url = package.download_url.as_deref().map_or_else(
+            || format!("{}/{}", config.url.trim_end_matches('/'), package.file),
+            str::to_owned,
+        );
         let response = request(&package_url, MAX_PACKAGE_SIZE)?;
         let content_length = response
             .header("Content-Length")
@@ -345,6 +351,9 @@ fn validate_package(package: &RepositoryPackage) -> Result<()> {
             package.file
         )));
     }
+    if let Some(url) = &package.download_url {
+        validate_download_url(url)?;
+    }
     if package.sha256.len() != 64 || !package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ArkError::InvalidPackage(format!(
             "Invalid SHA-256 digest for package '{} {}'",
@@ -352,6 +361,24 @@ fn validate_package(package: &RepositoryPackage) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_download_url(value: &str) -> Result<String> {
+    let parsed = Url::parse(value).map_err(|error| {
+        ArkError::InvalidPackage(format!("Invalid package download URL '{value}': {error}"))
+    })?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ArkError::InvalidPackage(
+            "Package download URLs must use HTTPS without credentials, query, or fragment".into(),
+        ));
+    }
+    Ok(parsed.to_string())
 }
 
 fn request(url: &str, limit: u64) -> Result<ureq::Response> {
@@ -420,6 +447,7 @@ mod tests {
             arch: "any".into(),
             description: "hello package".into(),
             file: file.into(),
+            download_url: None,
             sha256: "a".repeat(64),
         }
     }
@@ -446,6 +474,34 @@ mod tests {
         let mut invalid_hash = package("packages/hello.ark");
         invalid_hash.sha256 = "xyz".into();
         assert!(validate_package(&invalid_hash).is_err());
+    }
+
+    #[test]
+    fn accepts_secure_direct_download_urls_and_rejects_unsafe_ones() {
+        let mut direct = package("packages/hello.ark");
+        direct.download_url = Some(
+            "https://raw.githubusercontent.com/arkana-team/arkpkg-repo/main/packages/hello.ark"
+                .into(),
+        );
+        assert!(validate_package(&direct).is_ok());
+
+        for url in [
+            "http://example.com/hello.ark",
+            "https://user:pass@example.com/hello.ark",
+            "https://example.com/hello.ark?token=secret",
+            "https://example.com/hello.ark#fragment",
+        ] {
+            direct.download_url = Some(url.into());
+            assert!(validate_package(&direct).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn old_repository_index_entries_without_download_url_remain_valid() {
+        let json = r#"{"name":"hello","version":"1.2.3","arch":"any","description":"hello package","file":"packages/hello.ark","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let parsed: RepositoryPackage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.download_url, None);
+        assert!(validate_package(&parsed).is_ok());
     }
 
     #[test]
