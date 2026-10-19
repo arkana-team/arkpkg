@@ -6,7 +6,7 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
-use crate::checksum::compute_sha256_file;
+use crate::checksum::{compute_sha256_file, compute_sha256_path};
 use crate::database::{ArkInfo, Database};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
@@ -231,6 +231,7 @@ impl<'a> Installer<'a> {
         let pkg_checksum = compute_sha256_file(ark_path)?;
         let mut file_changes: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         let mut installed_rel_files = Vec::new();
+        let mut file_hashes = Vec::new();
         let mut preserved_files = Vec::new();
 
         for (src_path, rel_path) in &files_to_install {
@@ -276,7 +277,16 @@ impl<'a> Installer<'a> {
                 self.rollback(&file_changes);
                 return Err(error);
             }
-            installed_rel_files.push(PathBuf::from("/").join(rel_path));
+            let installed_path = PathBuf::from("/").join(rel_path);
+            let file_hash = match compute_sha256_path(&dest_path) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    self.rollback(&file_changes);
+                    return Err(ArkError::Io(error));
+                }
+            };
+            file_hashes.push((installed_path.clone(), file_hash));
+            installed_rel_files.push(installed_path);
         }
 
         // 13. Generate .arkinfo file
@@ -288,6 +298,7 @@ impl<'a> Installer<'a> {
             installed_at: chrono::Utc::now().to_rfc3339(),
             checksum: pkg_checksum,
             files: installed_rel_files.clone(),
+            file_hashes,
             dependencies: metadata.dependencies.clone(),
             provides: metadata.provides.clone(),
             conflicts: metadata.conflicts.clone(),

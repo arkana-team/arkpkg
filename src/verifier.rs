@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::checksum::compute_sha256_path;
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
 
@@ -8,6 +9,7 @@ pub enum VerifyStatus {
     Ok(PathBuf),
     Modified(PathBuf),
     Missing(PathBuf),
+    Unverified(PathBuf),
 }
 
 pub struct Verifier<'a> {
@@ -27,6 +29,8 @@ impl<'a> Verifier<'a> {
 
         let mut results = Vec::new();
         let mut failed = false;
+        let file_hashes: std::collections::HashMap<_, _> =
+            arkinfo.file_hashes.iter().cloned().collect();
 
         for (_, backup_rel) in &arkinfo.preserved_files {
             let backup_path = self
@@ -60,12 +64,24 @@ impl<'a> Verifier<'a> {
 
             match fs::symlink_metadata(&target_path) {
                 Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                    println!("OK      {}", file_rel.display());
-                    results.push(VerifyStatus::Ok(file_rel.clone()));
+                    if let Some(expected) = file_hashes.get(file_rel) {
+                        let actual = compute_sha256_path(&target_path)?;
+                        if actual.eq_ignore_ascii_case(expected) {
+                            println!("OK      {}", file_rel.display());
+                            results.push(VerifyStatus::Ok(file_rel.clone()));
+                        } else {
+                            println!("MODIFIED {}", file_rel.display());
+                            results.push(VerifyStatus::Modified(file_rel.clone()));
+                            failed = true;
+                        }
+                    } else {
+                        println!("UNVERIFIED {} (legacy metadata)", file_rel.display());
+                        results.push(VerifyStatus::Unverified(file_rel.clone()));
+                    }
                 }
                 Ok(_) => {
-                    println!("MISSING {}", file_rel.display());
-                    results.push(VerifyStatus::Missing(file_rel.clone()));
+                    println!("MODIFIED {}", file_rel.display());
+                    results.push(VerifyStatus::Modified(file_rel.clone()));
                     failed = true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
