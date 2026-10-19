@@ -33,6 +33,7 @@ impl Ord for VersionSegment {
 #[derive(Debug, Clone)]
 pub struct Version {
     raw: String,
+    epoch: u64,
     segments: Vec<VersionSegment>,
 }
 
@@ -43,8 +44,27 @@ impl Version {
         if s.is_empty() {
             return Err(ArkError::InvalidPackage("Empty version string".into()));
         }
-        if !s.as_bytes()[0].is_ascii_alphanumeric()
-            || !s
+        let (epoch, version) = match s.split_once(':') {
+            Some((epoch, version)) => {
+                if epoch.is_empty()
+                    || !epoch.bytes().all(|byte| byte.is_ascii_digit())
+                    || version.is_empty()
+                    || version.contains(':')
+                {
+                    return Err(ArkError::InvalidPackage(format!(
+                        "Invalid version string: {}",
+                        s
+                    )));
+                }
+                let epoch = epoch.parse::<u64>().map_err(|_| {
+                    ArkError::InvalidPackage(format!("Invalid version string: {}", s))
+                })?;
+                (epoch, version)
+            }
+            None => (0, s),
+        };
+        if !version.as_bytes()[0].is_ascii_alphanumeric()
+            || !version
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
         {
@@ -55,7 +75,7 @@ impl Version {
         }
 
         let mut segments = Vec::new();
-        for part in s.split(&['.', '-', '_'][..]) {
+        for part in version.split(&['.', '-', '_'][..]) {
             if part.is_empty() {
                 continue;
             }
@@ -75,6 +95,7 @@ impl Version {
 
         Ok(Self {
             raw: s.to_string(),
+            epoch,
             segments,
         })
     }
@@ -101,6 +122,11 @@ impl PartialOrd for Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
+        let epoch_order = self.epoch.cmp(&other.epoch);
+        if epoch_order != Ordering::Equal {
+            return epoch_order;
+        }
+
         let max_len = self.segments.len().max(other.segments.len());
         for i in 0..max_len {
             let seg1 = self.segments.get(i);
@@ -278,7 +304,15 @@ mod tests {
         assert_eq!(v1, v2);
         assert!(v1 > v3);
         assert!(v4 > v5); // 41 > 4
-        for invalid in ["../outside", "1/2", "1 0"] {
+        let debian_epoch = Version::parse("1:3.6.27-9").unwrap();
+        assert_eq!(debian_epoch.as_str(), "1:3.6.27-9");
+        assert!(debian_epoch > Version::parse("9.9.99").unwrap());
+        assert!(Version::parse("10:0.1").unwrap() > debian_epoch);
+        assert_eq!(
+            Version::parse("0:1.2").unwrap(),
+            Version::parse("1.2").unwrap()
+        );
+        for invalid in ["../outside", "1/2", "1 0", ":1", "1:", "a:1", "1:2:3"] {
             assert!(Version::parse(invalid).is_err(), "accepted {invalid:?}");
         }
     }
