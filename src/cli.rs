@@ -36,7 +36,7 @@ pub enum Commands {
         /// Path to a .ark archive or package name from a configured repository
         package: String,
 
-        /// Restrict repository lookup to this configured repository
+        /// Restrict package and dependency lookup to this configured repository
         #[arg(long)]
         repo: Option<String>,
     },
