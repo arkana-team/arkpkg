@@ -11,7 +11,7 @@ use url::Url;
 use crate::checksum::compute_sha256_file;
 use crate::errors::{ArkError, Result};
 use crate::metadata::{Metadata, validate_package_name};
-use crate::version::Version;
+use crate::version::{DependencyReq, Version};
 
 const MAX_INDEX_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PACKAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -43,6 +43,12 @@ pub struct RepositoryPackage {
 #[derive(Debug, Clone)]
 pub struct RepositoryManager {
     root: PathBuf,
+}
+
+/// A validated snapshot of the configured repository indexes.
+#[derive(Debug, Clone)]
+pub struct RepositoryCatalog {
+    repositories: Vec<(RepositoryConfig, Vec<RepositoryPackage>)>,
 }
 
 impl RepositoryManager {
@@ -161,6 +167,19 @@ impl RepositoryManager {
         Ok(matches)
     }
 
+    /// Fetches and validates each selected repository index once for a package operation.
+    pub fn catalog(&self, selected_repo: Option<&str>) -> Result<RepositoryCatalog> {
+        let repositories = self
+            .selected_repositories(selected_repo)?
+            .into_iter()
+            .map(|config| {
+                let packages = self.fetch_index(&config)?;
+                Ok((config, packages))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RepositoryCatalog { repositories })
+    }
+
     /// Downloads and validates the newest compatible archive for a package.
     pub fn download_package(
         &self,
@@ -168,34 +187,16 @@ impl RepositoryManager {
         selected_repo: Option<&str>,
     ) -> Result<NamedTempFile> {
         validate_package_name(package_name)?;
-        let configs = self.selected_repositories(selected_repo)?;
-        let current_arch = std::env::consts::ARCH;
-        let mut candidates = Vec::new();
+        let requirement = DependencyReq::parse(package_name)?;
+        self.catalog(selected_repo)?
+            .download_package_matching(&requirement)
+    }
+}
 
-        for config in configs {
-            for package in self.fetch_index(&config)? {
-                let arch_matches =
-                    package.arch == current_arch || package.arch == "any" || package.arch == "all";
-                if package.name == package_name && arch_matches {
-                    let version = Version::parse(&package.version)?;
-                    let arch_rank = u8::from(package.arch == current_arch);
-                    candidates.push((version, arch_rank, config.clone(), package));
-                }
-            }
-        }
-
-        candidates.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| right.2.name.cmp(&left.2.name))
-        });
-        let (_, _, config, package) = candidates.pop().ok_or_else(|| {
-            ArkError::PackageNotFound(format!(
-                "No compatible '{}' package was found in configured repositories",
-                package_name
-            ))
-        })?;
+impl RepositoryCatalog {
+    /// Downloads the newest compatible archive satisfying a package requirement.
+    pub fn download_package_matching(&self, requirement: &DependencyReq) -> Result<NamedTempFile> {
+        let (config, package) = self.best_candidate(requirement)?;
 
         let package_url = format!("{}/{}", config.url.trim_end_matches('/'), package.file);
         let response = request(&package_url, MAX_PACKAGE_SIZE)?;
@@ -244,6 +245,46 @@ impl RepositoryManager {
         Ok(temporary)
     }
 
+    fn best_candidate(
+        &self,
+        requirement: &DependencyReq,
+    ) -> Result<(&RepositoryConfig, &RepositoryPackage)> {
+        validate_package_name(&requirement.name)?;
+        let current_arch = std::env::consts::ARCH;
+        let mut candidates = Vec::new();
+
+        for (config, packages) in &self.repositories {
+            for package in packages {
+                let arch_matches =
+                    package.arch == current_arch || package.arch == "any" || package.arch == "all";
+                if package.name.eq_ignore_ascii_case(&requirement.name) && arch_matches {
+                    let version = Version::parse(&package.version)?;
+                    if !requirement.is_satisfied_by(&version) {
+                        continue;
+                    }
+                    let arch_rank = u8::from(package.arch == current_arch);
+                    candidates.push((version, arch_rank, config, package));
+                }
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| right.2.name.cmp(&left.2.name))
+        });
+        let (_, _, config, package) = candidates.pop().ok_or_else(|| {
+            ArkError::PackageNotFound(format!(
+                "No compatible package satisfying '{}' was found in configured repositories",
+                requirement
+            ))
+        })?;
+        Ok((config, package))
+    }
+}
+
+impl RepositoryManager {
     fn selected_repositories(&self, selected_repo: Option<&str>) -> Result<Vec<RepositoryConfig>> {
         let configs = self.list()?;
         if let Some(name) = selected_repo {
@@ -422,6 +463,42 @@ mod tests {
             file: file.into(),
             sha256: "a".repeat(64),
         }
+    }
+
+    #[test]
+    fn package_selection_respects_version_and_architecture_requirements() {
+        let package = |version: &str, arch: &str| RepositoryPackage {
+            name: "hello".into(),
+            version: version.into(),
+            arch: arch.into(),
+            description: "hello package".into(),
+            file: format!("packages/hello-{version}.ark"),
+            sha256: "a".repeat(64),
+        };
+        let catalog = RepositoryCatalog {
+            repositories: vec![(
+                RepositoryConfig {
+                    name: "main".into(),
+                    url: "https://example.com/arkpkg".into(),
+                },
+                vec![
+                    package("1.0", "any"),
+                    package("2.0", "any"),
+                    package("3.0", "other-arch"),
+                ],
+            )],
+        };
+
+        let (config, selected) = catalog
+            .best_candidate(&DependencyReq::parse("hello>=1.5").unwrap())
+            .unwrap();
+        assert_eq!(config.name, "main");
+        assert_eq!(selected.version, "2.0");
+        assert!(
+            catalog
+                .best_candidate(&DependencyReq::parse("hello>=3.0").unwrap())
+                .is_err()
+        );
     }
 
     #[test]
