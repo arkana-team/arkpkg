@@ -104,6 +104,45 @@ fn installer_rejects_packages_for_a_different_architecture() {
     assert!(!fake_root_dir.path().join("usr/bin/wrongarch").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn installer_does_not_create_parent_directories_through_out_of_root_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let pkg_source_dir = TempDir::new().unwrap();
+    let fake_root_dir = TempDir::new().unwrap();
+    let outside_root_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    fs::write(
+        pkg_source_dir.path().join("ARKPKG"),
+        "Name: pathguard\nDescription: reject out-of-root parent symlinks\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    let payload = pkg_source_dir
+        .path()
+        .join("package/usr/arkpkg-escape/deep/payload");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"must stay inside the install root").unwrap();
+    let archive = output_dir.path().join("pathguard.ark");
+    create_ark(pkg_source_dir.path(), &archive).unwrap();
+
+    symlink(
+        outside_root_dir.path(),
+        fake_root_dir.path().join("usr"),
+    )
+    .unwrap();
+
+    let db = Database::new(fake_root_dir.path());
+    let logger = Logger::new(fake_root_dir.path());
+    logger.init().unwrap();
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    assert!(matches!(
+        installer.install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert!(!outside_root_dir.path().join("arkpkg-escape").exists());
+}
+
 #[test]
 fn failed_install_restores_preexisting_files() {
     let pkg_source_dir = TempDir::new().unwrap();
