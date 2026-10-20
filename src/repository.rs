@@ -210,7 +210,7 @@ impl RepositoryCatalog {
             )));
         }
 
-        let mut temporary = NamedTempFile::new()?;
+        let mut temporary = crate::temp::file()?;
         let copied = std::io::copy(
             &mut response.into_reader().take(MAX_PACKAGE_SIZE + 1),
             &mut temporary,

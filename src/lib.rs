@@ -10,5 +10,6 @@ pub mod package;
 pub mod prompt;
 pub mod remover;
 pub mod repository;
+mod temp;
 pub mod verifier;
 pub mod version;

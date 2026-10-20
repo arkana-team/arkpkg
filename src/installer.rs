@@ -37,7 +37,7 @@ impl<'a> Installer<'a> {
             )));
         }
 
-        let temp_dir = tempfile::TempDir::new()?;
+        let temp_dir = crate::temp::directory()?;
 
         // 3, 4, 5. Decompress, read & validate metadata
         self.logger
