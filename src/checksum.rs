@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Result as IoResult};
 use std::path::Path;
 
@@ -27,6 +27,31 @@ pub fn compute_sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Computes the SHA-256 hash of a regular file or of a symlink's stored target.
+pub fn compute_sha256_path<P: AsRef<Path>>(path: P) -> IoResult<String> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(compute_sha256_bytes(target.as_os_str().as_bytes()));
+        }
+        #[cfg(not(unix))]
+        {
+            return Ok(compute_sha256_bytes(target.to_string_lossy().as_bytes()));
+        }
+    }
+    if metadata.is_file() {
+        return compute_sha256_file(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "checksum path is neither a regular file nor a symlink",
+    ))
+}
+
 /// Verifies whether the SHA-256 hash of a file matches the expected hash string.
 pub fn verify_file_sha256<P: AsRef<Path>>(path: P, expected_hash: &str) -> IoResult<bool> {
     let actual_hash = compute_sha256_file(path)?;
@@ -50,5 +75,22 @@ mod tests {
         let file_hash = compute_sha256_file(tmp.path()).unwrap();
         assert_eq!(expected, file_hash);
         assert!(verify_file_sha256(tmp.path(), &expected).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hashes_symlink_target_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let link = directory.path().join("command");
+        symlink("first-target", &link).unwrap();
+        let first = compute_sha256_path(&link).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink("second-target", &link).unwrap();
+        let second = compute_sha256_path(&link).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first, compute_sha256_bytes(b"first-target"));
     }
 }

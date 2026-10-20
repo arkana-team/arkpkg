@@ -78,6 +78,36 @@ testpkg=/usr/bin/testpkg
 }
 
 #[test]
+fn verifier_detects_modified_installed_files() {
+    let pkg_source_dir = TempDir::new().unwrap();
+    let fake_root_dir = TempDir::new().unwrap();
+    let output_dir = TempDir::new().unwrap();
+    fs::write(
+        pkg_source_dir.path().join("ARKPKG"),
+        "Name: tampercheck\nDescription: detect modified installed files\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    let payload = pkg_source_dir.path().join("package/usr/bin/tool");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"original package content").unwrap();
+    let archive = output_dir.path().join("tampercheck.ark");
+    create_ark(pkg_source_dir.path(), &archive).unwrap();
+
+    let db = Database::new(fake_root_dir.path());
+    let logger = Logger::new(fake_root_dir.path());
+    logger.init().unwrap();
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    let installed = fake_root_dir.path().join("usr/bin/tool");
+    fs::write(installed, b"modified content").unwrap();
+    assert!(matches!(
+        Verifier::new(&db).verify("tampercheck"),
+        Err(ArkError::VerificationFailed(_))
+    ));
+}
+
+#[test]
 fn installer_rejects_packages_for_a_different_architecture() {
     let pkg_source_dir = TempDir::new().unwrap();
     let fake_root_dir = TempDir::new().unwrap();
