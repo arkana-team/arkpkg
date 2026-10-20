@@ -323,6 +323,9 @@ mod tests {
             Version::parse("0:1.2").unwrap(),
             Version::parse("1.2").unwrap()
         );
+        let repacked_epoch = Version::parse("1:7.10.1+dfsg-1").unwrap();
+        assert_eq!(repacked_epoch.as_str(), "1:7.10.1+dfsg-1");
+        assert!(repacked_epoch > Version::parse("7.10.1+dfsg-1").unwrap());
         for invalid in ["../outside", "1/2", "1 0", ":1", "1:", "a:1", "1:2:3"] {
             assert!(Version::parse(invalid).is_err(), "accepted {invalid:?}");
         }
