@@ -17,6 +17,8 @@ pub struct ArkInfo {
     pub installed_at: String,
     pub checksum: String,
     pub files: Vec<PathBuf>,
+    /// Per-file SHA-256 values, recorded as (installed path, digest).
+    pub file_hashes: Vec<(PathBuf, String)>,
     pub dependencies: Vec<DependencyReq>,
     pub provides: Vec<ProvideItem>,
     pub conflicts: Vec<String>,
@@ -33,6 +35,7 @@ impl ArkInfo {
         let mut installed_at = None;
         let mut checksum = None;
         let mut files = Vec::new();
+        let mut file_hashes = Vec::new();
         let mut dependencies = Vec::new();
         let mut provides = Vec::new();
         let mut conflicts = Vec::new();
@@ -77,6 +80,12 @@ impl ArkInfo {
                             files.push(PathBuf::from(v));
                         }
                     }
+                    "FileHashes" => {
+                        current_section = Some("FileHashes");
+                        if !v.is_empty() {
+                            file_hashes.push(parse_file_hash(v)?);
+                        }
+                    }
                     "Dependencies" => {
                         current_section = Some("Dependencies");
                         if !v.is_empty() {
@@ -105,6 +114,7 @@ impl ArkInfo {
                         if let Some(sec) = current_section {
                             match sec {
                                 "Files" => files.push(PathBuf::from(trimmed)),
+                                "FileHashes" => file_hashes.push(parse_file_hash(trimmed)?),
                                 "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
                                 "Provides" => provides.push(ProvideItem::parse(trimmed)?),
                                 "Conflicts" => conflicts.push(trimmed.to_string()),
@@ -119,6 +129,7 @@ impl ArkInfo {
             } else if let Some(sec) = current_section {
                 match sec {
                     "Files" => files.push(PathBuf::from(trimmed)),
+                    "FileHashes" => file_hashes.push(parse_file_hash(trimmed)?),
                     "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
                     "Provides" => provides.push(ProvideItem::parse(trimmed)?),
                     "Conflicts" => conflicts.push(trimmed.to_string()),
@@ -137,6 +148,7 @@ impl ArkInfo {
         for path in &files {
             validate_installed_path(path)?;
         }
+        validate_file_hashes(&files, &file_hashes)?;
         validate_preserved_files(&files, &preserved_files)?;
         for dependency in &dependencies {
             validate_package_name(&dependency.name)?;
@@ -154,6 +166,7 @@ impl ArkInfo {
             installed_at,
             checksum,
             files,
+            file_hashes,
             dependencies,
             provides,
             conflicts,
@@ -173,6 +186,13 @@ impl ArkInfo {
         out.push_str("Files:\n");
         for f in &self.files {
             out.push_str(&format!("{}\n", f.display()));
+        }
+
+        if !self.file_hashes.is_empty() {
+            out.push_str("FileHashes:\n");
+            for (path, hash) in &self.file_hashes {
+                out.push_str(&format!("{}:{}\n", path.display(), hash));
+            }
         }
 
         if !self.preserved_files.is_empty() {
@@ -203,6 +223,42 @@ impl ArkInfo {
 
         out
     }
+}
+
+fn parse_file_hash(value: &str) -> Result<(PathBuf, String)> {
+    let (path, hash) = value
+        .rsplit_once(':')
+        .ok_or_else(|| ArkError::InvalidPackage("Malformed FileHashes entry".into()))?;
+    Ok((PathBuf::from(path), hash.to_string()))
+}
+
+fn validate_file_hashes(files: &[PathBuf], file_hashes: &[(PathBuf, String)]) -> Result<()> {
+    if file_hashes.is_empty() {
+        return Ok(());
+    }
+    if file_hashes.len() != files.len() {
+        return Err(ArkError::InvalidPackage(
+            "FileHashes must contain one digest for every installed file".into(),
+        ));
+    }
+    let file_paths: HashSet<_> = files.iter().cloned().collect();
+    let mut seen = HashSet::new();
+    for (path, hash) in file_hashes {
+        validate_installed_path(path)?;
+        if !file_paths.contains(path) || !seen.insert(path.clone()) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Invalid or duplicate file hash path '{}'",
+                path.display()
+            )));
+        }
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Invalid SHA-256 digest for '{}'",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_installed_path(path: &Path) -> Result<()> {
@@ -583,6 +639,7 @@ mod tests {
             installed_at: "2026-07-29T12:00:00Z".into(),
             checksum: "abc123hash".into(),
             files: vec![file_path.clone()],
+            file_hashes: vec![(file_path.clone(), "a".repeat(64))],
             dependencies: vec![DependencyReq::parse("glibc>=2.39").unwrap()],
             provides: vec![],
             conflicts: vec!["busybox".into()],
@@ -596,6 +653,7 @@ mod tests {
         let loaded = db.read_arkinfo("bash").unwrap();
         assert_eq!(loaded.name, "bash");
         assert_eq!(loaded.files, vec![file_path]);
+        assert_eq!(loaded.file_hashes, arkinfo.file_hashes);
         assert_eq!(loaded.dependencies, arkinfo.dependencies);
         assert_eq!(loaded.conflicts, arkinfo.conflicts);
         assert_eq!(loaded.preserved_files, arkinfo.preserved_files);
@@ -629,6 +687,24 @@ mod tests {
         let arkinfo =
             ArkInfo::parse("Name: sample\nVersion: 1.0.0\nFiles:\n/usr/bin/sample\n").unwrap();
         assert!(arkinfo.preserved_files.is_empty());
+        assert!(arkinfo.file_hashes.is_empty());
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_file_hashes() {
+        let valid_path = "/usr/bin/sample";
+        let invalid = [
+            format!(
+                "Name: sample\nVersion: 1.0\nFiles:\n{valid_path}\nFileHashes:\n{valid_path}:bad\n"
+            ),
+            format!(
+                "Name: sample\nVersion: 1.0\nFiles:\n{valid_path}\nFileHashes:\n/usr/bin/other:{}\n",
+                "a".repeat(64)
+            ),
+        ];
+        for content in invalid {
+            assert!(ArkInfo::parse(&content).is_err());
+        }
     }
 
     #[test]

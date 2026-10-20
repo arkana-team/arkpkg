@@ -36,6 +36,9 @@ pub struct RepositoryPackage {
     #[serde(default)]
     pub description: String,
     pub file: String,
+    /// Optional absolute HTTPS URL for repositories hosted separately from their index.
+    #[serde(default)]
+    pub download_url: Option<String>,
     pub sha256: String,
 }
 
@@ -48,6 +51,7 @@ pub struct RepositoryManager {
 /// A validated snapshot of the configured repository indexes.
 #[derive(Debug, Clone)]
 pub struct RepositoryCatalog {
+    root: PathBuf,
     repositories: Vec<(RepositoryConfig, Vec<RepositoryPackage>)>,
 }
 
@@ -177,7 +181,10 @@ impl RepositoryManager {
                 Ok((config, packages))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(RepositoryCatalog { repositories })
+        Ok(RepositoryCatalog {
+            root: self.root.clone(),
+            repositories,
+        })
     }
 
     /// Downloads and validates the newest compatible archive for a package.
@@ -198,7 +205,10 @@ impl RepositoryCatalog {
     pub fn download_package_matching(&self, requirement: &DependencyReq) -> Result<NamedTempFile> {
         let (config, package) = self.best_candidate(requirement)?;
 
-        let package_url = format!("{}/{}", config.url.trim_end_matches('/'), package.file);
+        let package_url = package.download_url.as_deref().map_or_else(
+            || format!("{}/{}", config.url.trim_end_matches('/'), package.file),
+            str::to_owned,
+        );
         let response = request(&package_url, MAX_PACKAGE_SIZE)?;
         let content_length = response
             .header("Content-Length")
@@ -210,7 +220,7 @@ impl RepositoryCatalog {
             )));
         }
 
-        let mut temporary = crate::temp::file()?;
+        let mut temporary = self.download_tempfile()?;
         let copied = std::io::copy(
             &mut response.into_reader().take(MAX_PACKAGE_SIZE + 1),
             &mut temporary,
@@ -243,6 +253,10 @@ impl RepositoryCatalog {
         }
 
         Ok(temporary)
+    }
+
+    fn download_tempfile(&self) -> Result<NamedTempFile> {
+        rooted_download_tempfile(&self.root)
     }
 
     fn best_candidate(
@@ -336,6 +350,21 @@ impl RepositoryManager {
     }
 }
 
+fn rooted_download_tempfile(root: &Path) -> Result<NamedTempFile> {
+    let cache_dir = root.join("var/cache/arkpkg/downloads");
+    fs::create_dir_all(&cache_dir)?;
+    let canonical_root = root.canonicalize()?;
+    let canonical_cache = cache_dir.canonicalize()?;
+    if !canonical_cache.starts_with(&canonical_root) {
+        return Err(ArkError::InvalidPackage(format!(
+            "Package download cache '{}' resolves outside target root '{}'",
+            canonical_cache.display(),
+            canonical_root.display()
+        )));
+    }
+    Ok(NamedTempFile::new_in(canonical_cache)?)
+}
+
 fn validate_repository_url(value: &str) -> Result<String> {
     let parsed = Url::parse(value.trim()).map_err(|error| {
         ArkError::InvalidPackage(format!("Invalid repository URL '{value}': {error}"))
@@ -386,6 +415,9 @@ fn validate_package(package: &RepositoryPackage) -> Result<()> {
             package.file
         )));
     }
+    if let Some(url) = &package.download_url {
+        validate_download_url(url)?;
+    }
     if package.sha256.len() != 64 || !package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ArkError::InvalidPackage(format!(
             "Invalid SHA-256 digest for package '{} {}'",
@@ -393,6 +425,24 @@ fn validate_package(package: &RepositoryPackage) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_download_url(value: &str) -> Result<String> {
+    let parsed = Url::parse(value).map_err(|error| {
+        ArkError::InvalidPackage(format!("Invalid package download URL '{value}': {error}"))
+    })?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ArkError::InvalidPackage(
+            "Package download URLs must use HTTPS without credentials, query, or fragment".into(),
+        ));
+    }
+    Ok(parsed.to_string())
 }
 
 fn request(url: &str, limit: u64) -> Result<ureq::Response> {
@@ -461,6 +511,7 @@ mod tests {
             arch: "any".into(),
             description: "hello package".into(),
             file: file.into(),
+            download_url: None,
             sha256: "a".repeat(64),
         }
     }
@@ -473,9 +524,12 @@ mod tests {
             arch: arch.into(),
             description: "hello package".into(),
             file: format!("packages/hello-{version}.ark"),
+            download_url: None,
             sha256: "a".repeat(64),
         };
+        let root = TempDir::new().unwrap();
         let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
             repositories: vec![(
                 RepositoryConfig {
                     name: "main".into(),
@@ -526,6 +580,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_secure_direct_download_urls_and_rejects_unsafe_ones() {
+        let mut direct = package("packages/hello.ark");
+        direct.download_url = Some(
+            "https://raw.githubusercontent.com/arkana-team/arkpkg-repo/main/packages/hello.ark"
+                .into(),
+        );
+        assert!(validate_package(&direct).is_ok());
+
+        for url in [
+            "http://example.com/hello.ark",
+            "https://user:pass@example.com/hello.ark",
+            "https://example.com/hello.ark?token=secret",
+            "https://example.com/hello.ark#fragment",
+        ] {
+            direct.download_url = Some(url.into());
+            assert!(validate_package(&direct).is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn old_repository_index_entries_without_download_url_remain_valid() {
+        let json = r#"{"name":"hello","version":"1.2.3","arch":"any","description":"hello package","file":"packages/hello.ark","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let parsed: RepositoryPackage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.download_url, None);
+        assert!(validate_package(&parsed).is_ok());
+    }
+
+    #[test]
     fn repository_configs_are_added_listed_and_removed_under_the_target_root() {
         let root = TempDir::new().unwrap();
         let repositories = RepositoryManager::new(root.path());
@@ -538,5 +620,44 @@ mod tests {
         );
         repositories.remove("main").unwrap();
         assert!(repositories.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn package_download_tempfiles_use_the_target_root_cache() {
+        let root = TempDir::new().unwrap();
+        let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
+            repositories: Vec::new(),
+        };
+
+        let temporary = catalog.download_tempfile().unwrap();
+
+        assert!(
+            temporary.path().starts_with(
+                root.path()
+                    .join("var/cache/arkpkg/downloads")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_download_cache_rejects_symlinks_outside_the_target_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let cache_parent = root.path().join("var/cache/arkpkg");
+        fs::create_dir_all(&cache_parent).unwrap();
+        symlink(outside.path(), cache_parent.join("downloads")).unwrap();
+        let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
+            repositories: Vec::new(),
+        };
+
+        assert!(catalog.download_tempfile().is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

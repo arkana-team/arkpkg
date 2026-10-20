@@ -1,5 +1,5 @@
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder};
@@ -30,6 +30,7 @@ pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
     let entries = tar_archive
         .entries()
         .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
+    let mut seen_paths: HashMap<PathBuf, bool> = HashMap::new();
     let mut symlink_paths = HashSet::new();
     for entry in entries {
         let mut entry = entry.map_err(|error| {
@@ -61,6 +62,16 @@ pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
             )));
         }
         let entry_type = entry.header().entry_type();
+        if let Some(previous_was_directory) = seen_paths.get(&path) {
+            if !*previous_was_directory || !entry_type.is_dir() {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Duplicate archive entry at '{}'",
+                    path.display()
+                )));
+            }
+        } else {
+            seen_paths.insert(path.clone(), entry_type.is_dir());
+        }
         if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
             return Err(ArkError::InvalidPackage(format!(
                 "Unsupported archive entry type at '{}'",
@@ -210,6 +221,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn append_entry(
+        archive: &mut Builder<FrameEncoder<File>>,
+        path: &str,
+        entry_type: tar::EntryType,
+        content: &[u8],
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(entry_type);
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, content).unwrap();
+    }
+
     #[test]
     fn test_create_and_extract_ark() {
         let src_dir = TempDir::new().unwrap();
@@ -268,5 +294,48 @@ Arch: x86_64
                 .join("outside")
                 .exists()
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_payload_paths() {
+        let archive_dir = TempDir::new().unwrap();
+        let extraction_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("duplicate-payload.ark");
+        let output = File::create(&archive_path).unwrap();
+        let mut archive = Builder::new(FrameEncoder::new(output));
+        let metadata = b"Name: duplicate\nDescription: test\nVersion: 1.0\nArch: any\n";
+        append_entry(&mut archive, "ARKPKG", tar::EntryType::Regular, metadata);
+        append_entry(&mut archive, "package", tar::EntryType::Directory, b"");
+        append_entry(
+            &mut archive,
+            "package/usr/bin/tool",
+            tar::EntryType::Regular,
+            b"first payload",
+        );
+        append_entry(
+            &mut archive,
+            "package/usr/bin/tool",
+            tar::EntryType::Regular,
+            b"replacement payload",
+        );
+        archive.into_inner().unwrap().finish().unwrap();
+
+        assert!(extract_ark(&archive_path, extraction_dir.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_metadata_entries() {
+        let archive_dir = TempDir::new().unwrap();
+        let extraction_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("duplicate-metadata.ark");
+        let output = File::create(&archive_path).unwrap();
+        let mut archive = Builder::new(FrameEncoder::new(output));
+        let metadata = b"Name: duplicate\nDescription: test\nVersion: 1.0\nArch: any\n";
+        append_entry(&mut archive, "ARKPKG", tar::EntryType::Regular, metadata);
+        append_entry(&mut archive, "ARKPKG", tar::EntryType::Regular, metadata);
+        append_entry(&mut archive, "package", tar::EntryType::Directory, b"");
+        archive.into_inner().unwrap().finish().unwrap();
+
+        assert!(extract_ark(&archive_path, extraction_dir.path()).is_err());
     }
 }
