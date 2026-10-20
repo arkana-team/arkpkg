@@ -431,14 +431,41 @@ impl Database {
 
     /// Atomically registers file ownerships for a package in `file.db`.
     pub fn add_file_ownership(&self, files: &[PathBuf], pkg_name: &str) -> Result<()> {
-        validate_package_name(pkg_name)?;
         let mut map = self.read_file_ownership()?;
+        self.add_file_ownership_from_map(&mut map, files, pkg_name)
+    }
+
+    /// Registers ownerships using a map already loaded by the caller.
+    pub(crate) fn add_file_ownership_from_map(
+        &self,
+        map: &mut HashMap<PathBuf, String>,
+        files: &[PathBuf],
+        pkg_name: &str,
+    ) -> Result<()> {
+        validate_package_name(pkg_name)?;
         for f in files {
             validate_installed_path(f)?;
+        }
+
+        let previous_owners: Vec<_> = files
+            .iter()
+            .map(|file| (file.clone(), map.get(file).cloned()))
+            .collect();
+        for f in files {
             map.insert(f.clone(), pkg_name.to_string());
         }
 
-        self.atomic_write_file_db(&map)
+        if let Err(error) = self.atomic_write_file_db(map) {
+            for (file, previous_owner) in previous_owners {
+                if let Some(owner) = previous_owner {
+                    map.insert(file, owner);
+                } else {
+                    map.remove(&file);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Atomically removes file ownership entries for specific files from `file.db`.
@@ -542,6 +569,13 @@ mod tests {
             Some("bash".to_string())
         );
 
+        let extra_file = PathBuf::from("/usr/share/bash/README");
+        let mut ownership = db.read_file_ownership().unwrap();
+        db.add_file_ownership_from_map(&mut ownership, std::slice::from_ref(&extra_file), "bash")
+            .unwrap();
+        assert_eq!(ownership.get(&extra_file).map(String::as_str), Some("bash"));
+        assert_eq!(db.read_file_ownership().unwrap(), ownership);
+
         let arkinfo = ArkInfo {
             name: "bash".into(),
             version: Version::parse("5.3.0").unwrap(),
@@ -565,6 +599,29 @@ mod tests {
         assert_eq!(loaded.dependencies, arkinfo.dependencies);
         assert_eq!(loaded.conflicts, arkinfo.conflicts);
         assert_eq!(loaded.preserved_files, arkinfo.preserved_files);
+    }
+
+    #[test]
+    fn failed_file_ownership_persist_restores_the_supplied_map() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Database::new(temp_dir.path());
+        db.init().unwrap();
+
+        let existing = PathBuf::from("/usr/bin/existing");
+        db.add_file_ownership(std::slice::from_ref(&existing), "original")
+            .unwrap();
+        let mut ownership = db.read_file_ownership().unwrap();
+        let before = ownership.clone();
+
+        fs::remove_file(db.file_db_path()).unwrap();
+        fs::create_dir(db.file_db_path()).unwrap();
+
+        let added = PathBuf::from("/usr/bin/added");
+        assert!(
+            db.add_file_ownership_from_map(&mut ownership, &[existing, added], "replacement")
+                .is_err()
+        );
+        assert_eq!(ownership, before);
     }
 
     #[test]
