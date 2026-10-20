@@ -215,7 +215,7 @@ impl RepositoryManager {
             )));
         }
 
-        let mut temporary = NamedTempFile::new()?;
+        let mut temporary = self.download_tempfile()?;
         let copied = std::io::copy(
             &mut response.into_reader().take(MAX_PACKAGE_SIZE + 1),
             &mut temporary,
@@ -248,6 +248,21 @@ impl RepositoryManager {
         }
 
         Ok(temporary)
+    }
+
+    fn download_tempfile(&self) -> Result<NamedTempFile> {
+        let cache_dir = self.root.join("var/cache/arkpkg/downloads");
+        fs::create_dir_all(&cache_dir)?;
+        let canonical_root = self.root.canonicalize()?;
+        let canonical_cache = cache_dir.canonicalize()?;
+        if !canonical_cache.starts_with(&canonical_root) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package download cache '{}' resolves outside target root '{}'",
+                canonical_cache.display(),
+                canonical_root.display()
+            )));
+        }
+        Ok(NamedTempFile::new_in(canonical_cache)?)
     }
 
     fn selected_repositories(&self, selected_repo: Option<&str>) -> Result<Vec<RepositoryConfig>> {
@@ -517,5 +532,38 @@ mod tests {
         );
         repositories.remove("main").unwrap();
         assert!(repositories.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn package_download_tempfiles_use_the_target_root_cache() {
+        let root = TempDir::new().unwrap();
+        let repositories = RepositoryManager::new(root.path());
+
+        let temporary = repositories.download_tempfile().unwrap();
+
+        assert!(
+            temporary.path().starts_with(
+                root.path()
+                    .join("var/cache/arkpkg/downloads")
+                    .canonicalize()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_download_cache_rejects_symlinks_outside_the_target_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let cache_parent = root.path().join("var/cache/arkpkg");
+        fs::create_dir_all(&cache_parent).unwrap();
+        symlink(outside.path(), cache_parent.join("downloads")).unwrap();
+        let repositories = RepositoryManager::new(root.path());
+
+        assert!(repositories.download_tempfile().is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }
