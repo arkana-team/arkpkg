@@ -236,15 +236,11 @@ impl<'a> Installer<'a> {
 
         for (src_path, rel_path) in &files_to_install {
             let dest_path = self.db.root().join(rel_path);
-            if let Some(parent) = dest_path.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
-                    self.rollback(&file_changes);
-                    return Err(ArkError::Io(error));
-                }
-                if let Err(error) = validate_destination_parent(self.db.root(), parent) {
-                    self.rollback(&file_changes);
-                    return Err(error);
-                }
+            if let Some(parent) = dest_path.parent()
+                && let Err(error) = create_destination_parent(self.db.root(), parent)
+            {
+                self.rollback(&file_changes);
+                return Err(error);
             }
 
             let backup = match backup_existing_file(&dest_path) {
@@ -373,18 +369,64 @@ fn path_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn validate_destination_parent(root: &Path, parent: &Path) -> Result<()> {
+fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
     let canonical_root = root.canonicalize()?;
-    let canonical_parent = parent.canonicalize()?;
-    if canonical_parent.starts_with(&canonical_root) {
-        Ok(())
-    } else {
-        Err(ArkError::InvalidPackage(format!(
-            "Install destination '{}' resolves outside target root '{}'",
-            canonical_parent.display(),
-            canonical_root.display()
-        )))
+    let relative_parent = parent.strip_prefix(root).map_err(|error| {
+        ArkError::InvalidPackage(format!(
+            "Install destination '{}' is not beneath target root '{}': {error}",
+            parent.display(),
+            root.display()
+        ))
+    })?;
+    let mut current = root.to_path_buf();
+
+    for component in relative_parent.components() {
+        let Component::Normal(name) = component else {
+            return Err(ArkError::InvalidPackage(format!(
+                "Unsafe install parent path '{}'",
+                relative_parent.display()
+            )));
+        };
+        current.push(name);
+
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => fs::symlink_metadata(&current)?,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        fs::symlink_metadata(&current)?
+                    }
+                    Err(error) => return Err(ArkError::Io(error)),
+                }
+            }
+            Err(error) => return Err(ArkError::Io(error)),
+        };
+
+        if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+            return Err(ArkError::PackageConflict(format!(
+                "Install parent '{}' is not a directory",
+                current.display()
+            )));
+        }
+
+        let canonical_current = current.canonicalize()?;
+        if !canonical_current.starts_with(&canonical_root) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Install destination '{}' resolves outside target root '{}'",
+                canonical_current.display(),
+                canonical_root.display()
+            )));
+        }
+        if !canonical_current.is_dir() {
+            return Err(ArkError::PackageConflict(format!(
+                "Install parent '{}' does not resolve to a directory",
+                current.display()
+            )));
+        }
     }
+
+    Ok(())
 }
 
 fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {
