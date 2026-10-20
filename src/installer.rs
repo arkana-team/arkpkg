@@ -37,7 +37,7 @@ impl<'a> Installer<'a> {
             )));
         }
 
-        let temp_dir = tempfile::TempDir::new()?;
+        let temp_dir = crate::temp::directory()?;
 
         // 3, 4, 5. Decompress, read & validate metadata
         self.logger
@@ -160,7 +160,7 @@ impl<'a> Installer<'a> {
         // 10 & 11. Check for file conflicts and prompt user
         self.logger.info("Checking file conflicts");
         let pkg_files_root = temp_dir.path().join("package");
-        let file_ownership = self.db.read_file_ownership()?;
+        let mut file_ownership = self.db.read_file_ownership()?;
 
         let mut files_to_install = Vec::new();
         let mut conflicts_to_prompt = Vec::new();
@@ -319,10 +319,11 @@ impl<'a> Installer<'a> {
 
         // 15. Update file.db
         self.logger.info("Updating file database (file.db)");
-        if let Err(error) = self
-            .db
-            .add_file_ownership(&installed_rel_files, &metadata.name)
-        {
+        if let Err(error) = self.db.add_file_ownership_from_map(
+            &mut file_ownership,
+            &installed_rel_files,
+            &metadata.name,
+        ) {
             self.rollback(&file_changes);
             let _ = self.db.remove_arkinfo(&metadata.name);
             let _ = self.db.remove_installed_package(&metadata.name);

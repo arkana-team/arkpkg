@@ -11,6 +11,7 @@ use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
 use arkpkg::remover::Remover;
 use arkpkg::repository::RepositoryManager;
+use arkpkg::resolver::resolve_install_plan;
 use arkpkg::verifier::Verifier;
 
 fn run() -> Result<()> {
@@ -28,17 +29,30 @@ fn run() -> Result<()> {
     let logger = Logger::new(&root_path);
     logger.init()?;
 
-    let prompt = PromptHandler::new(cli.auto_yes, cli.auto_no, cli.force);
+    let mut prompt = PromptHandler::new(cli.auto_yes, cli.auto_no, cli.force);
 
     match cli.command {
         Commands::Install { package, repo } => {
-            let mut installer = Installer::new(&db, &logger, prompt);
             let local_path = PathBuf::from(&package);
             if local_path.is_file() {
+                let mut installer = Installer::new(&db, &logger, prompt);
                 installer.install(local_path)?;
             } else {
-                let downloaded = repositories.download_package(&package, repo.as_deref())?;
-                installer.install(downloaded.path())?;
+                let catalog = repositories.catalog(repo.as_deref())?;
+                let plan = resolve_install_plan(&db, &catalog, &package)?;
+                if plan.len() > 1 {
+                    println!("The following packages will be installed:");
+                    for resolved in &plan {
+                        println!("  {} {}", resolved.metadata.name, resolved.metadata.version);
+                    }
+                    if !prompt.ask("Install this package and its dependencies?")? {
+                        return Err(arkpkg::errors::ArkError::UserCancelled);
+                    }
+                }
+                let mut installer = Installer::new(&db, &logger, prompt);
+                for resolved in plan {
+                    installer.install(resolved.archive.path())?;
+                }
             }
         }
         Commands::Remove { package_name } => {

@@ -239,6 +239,15 @@ impl Metadata {
         let version =
             version.ok_or_else(|| ArkError::InvalidPackage("Missing field: Version".into()))?;
         let arch = arch.ok_or_else(|| ArkError::InvalidPackage("Missing field: Arch".into()))?;
+        for dependency in &dependencies {
+            validate_package_name(&dependency.name)?;
+        }
+        for provide in &provides {
+            validate_package_name(&provide.name)?;
+        }
+        for conflict in &conflicts {
+            validate_package_name(conflict)?;
+        }
 
         Ok(Self {
             name,
@@ -336,6 +345,19 @@ busybox-sh
         for name in ["../outside", "a/b", "", ".hidden", "name with spaces"] {
             let content = format!("Name: {name}\nDescription: test\nVersion: 1.0\nArch: any\n");
             assert!(Metadata::parse(&content).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_dependency_provide_and_conflict_names() {
+        for field in ["Dependencies", "Provides", "Conflicts"] {
+            let content = format!(
+                "Name: safe\nDescription: test\nVersion: 1.0\nArch: any\n{field}:\n../outside\n"
+            );
+            assert!(
+                Metadata::parse(&content).is_err(),
+                "accepted unsafe {field}"
+            );
         }
     }
 }

@@ -11,7 +11,7 @@ use url::Url;
 use crate::checksum::compute_sha256_file;
 use crate::errors::{ArkError, Result};
 use crate::metadata::{Metadata, validate_package_name};
-use crate::version::Version;
+use crate::version::{DependencyReq, Version};
 
 const MAX_INDEX_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PACKAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -46,6 +46,13 @@ pub struct RepositoryPackage {
 #[derive(Debug, Clone)]
 pub struct RepositoryManager {
     root: PathBuf,
+}
+
+/// A validated snapshot of the configured repository indexes.
+#[derive(Debug, Clone)]
+pub struct RepositoryCatalog {
+    root: PathBuf,
+    repositories: Vec<(RepositoryConfig, Vec<RepositoryPackage>)>,
 }
 
 impl RepositoryManager {
@@ -164,6 +171,22 @@ impl RepositoryManager {
         Ok(matches)
     }
 
+    /// Fetches and validates each selected repository index once for a package operation.
+    pub fn catalog(&self, selected_repo: Option<&str>) -> Result<RepositoryCatalog> {
+        let repositories = self
+            .selected_repositories(selected_repo)?
+            .into_iter()
+            .map(|config| {
+                let packages = self.fetch_index(&config)?;
+                Ok((config, packages))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RepositoryCatalog {
+            root: self.root.clone(),
+            repositories,
+        })
+    }
+
     /// Downloads and validates the newest compatible archive for a package.
     pub fn download_package(
         &self,
@@ -171,34 +194,16 @@ impl RepositoryManager {
         selected_repo: Option<&str>,
     ) -> Result<NamedTempFile> {
         validate_package_name(package_name)?;
-        let configs = self.selected_repositories(selected_repo)?;
-        let current_arch = std::env::consts::ARCH;
-        let mut candidates = Vec::new();
+        let requirement = DependencyReq::parse(package_name)?;
+        self.catalog(selected_repo)?
+            .download_package_matching(&requirement)
+    }
+}
 
-        for config in configs {
-            for package in self.fetch_index(&config)? {
-                let arch_matches =
-                    package.arch == current_arch || package.arch == "any" || package.arch == "all";
-                if package.name == package_name && arch_matches {
-                    let version = Version::parse(&package.version)?;
-                    let arch_rank = u8::from(package.arch == current_arch);
-                    candidates.push((version, arch_rank, config.clone(), package));
-                }
-            }
-        }
-
-        candidates.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| right.2.name.cmp(&left.2.name))
-        });
-        let (_, _, config, package) = candidates.pop().ok_or_else(|| {
-            ArkError::PackageNotFound(format!(
-                "No compatible '{}' package was found in configured repositories",
-                package_name
-            ))
-        })?;
+impl RepositoryCatalog {
+    /// Downloads the newest compatible archive satisfying a package requirement.
+    pub fn download_package_matching(&self, requirement: &DependencyReq) -> Result<NamedTempFile> {
+        let (config, package) = self.best_candidate(requirement)?;
 
         let package_url = package.download_url.as_deref().map_or_else(
             || format!("{}/{}", config.url.trim_end_matches('/'), package.file),
@@ -251,20 +256,49 @@ impl RepositoryManager {
     }
 
     fn download_tempfile(&self) -> Result<NamedTempFile> {
-        let cache_dir = self.root.join("var/cache/arkpkg/downloads");
-        fs::create_dir_all(&cache_dir)?;
-        let canonical_root = self.root.canonicalize()?;
-        let canonical_cache = cache_dir.canonicalize()?;
-        if !canonical_cache.starts_with(&canonical_root) {
-            return Err(ArkError::InvalidPackage(format!(
-                "Package download cache '{}' resolves outside target root '{}'",
-                canonical_cache.display(),
-                canonical_root.display()
-            )));
-        }
-        Ok(NamedTempFile::new_in(canonical_cache)?)
+        rooted_download_tempfile(&self.root)
     }
 
+    fn best_candidate(
+        &self,
+        requirement: &DependencyReq,
+    ) -> Result<(&RepositoryConfig, &RepositoryPackage)> {
+        validate_package_name(&requirement.name)?;
+        let current_arch = std::env::consts::ARCH;
+        let mut candidates = Vec::new();
+
+        for (config, packages) in &self.repositories {
+            for package in packages {
+                let arch_matches =
+                    package.arch == current_arch || package.arch == "any" || package.arch == "all";
+                if package.name.eq_ignore_ascii_case(&requirement.name) && arch_matches {
+                    let version = Version::parse(&package.version)?;
+                    if !requirement.is_satisfied_by(&version) {
+                        continue;
+                    }
+                    let arch_rank = u8::from(package.arch == current_arch);
+                    candidates.push((version, arch_rank, config, package));
+                }
+            }
+        }
+
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| right.2.name.cmp(&left.2.name))
+        });
+        let (_, _, config, package) = candidates.pop().ok_or_else(|| {
+            ArkError::PackageNotFound(format!(
+                "No compatible package satisfying '{}' was found in configured repositories",
+                requirement
+            ))
+        })?;
+        Ok((config, package))
+    }
+}
+
+impl RepositoryManager {
     fn selected_repositories(&self, selected_repo: Option<&str>) -> Result<Vec<RepositoryConfig>> {
         let configs = self.list()?;
         if let Some(name) = selected_repo {
@@ -314,6 +348,21 @@ impl RepositoryManager {
         }
         Ok(index.packages)
     }
+}
+
+fn rooted_download_tempfile(root: &Path) -> Result<NamedTempFile> {
+    let cache_dir = root.join("var/cache/arkpkg/downloads");
+    fs::create_dir_all(&cache_dir)?;
+    let canonical_root = root.canonicalize()?;
+    let canonical_cache = cache_dir.canonicalize()?;
+    if !canonical_cache.starts_with(&canonical_root) {
+        return Err(ArkError::InvalidPackage(format!(
+            "Package download cache '{}' resolves outside target root '{}'",
+            canonical_cache.display(),
+            canonical_root.display()
+        )));
+    }
+    Ok(NamedTempFile::new_in(canonical_cache)?)
 }
 
 fn validate_repository_url(value: &str) -> Result<String> {
@@ -468,6 +517,45 @@ mod tests {
     }
 
     #[test]
+    fn package_selection_respects_version_and_architecture_requirements() {
+        let package = |version: &str, arch: &str| RepositoryPackage {
+            name: "hello".into(),
+            version: version.into(),
+            arch: arch.into(),
+            description: "hello package".into(),
+            file: format!("packages/hello-{version}.ark"),
+            download_url: None,
+            sha256: "a".repeat(64),
+        };
+        let root = TempDir::new().unwrap();
+        let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
+            repositories: vec![(
+                RepositoryConfig {
+                    name: "main".into(),
+                    url: "https://example.com/arkpkg".into(),
+                },
+                vec![
+                    package("1.0", "any"),
+                    package("2.0", "any"),
+                    package("3.0", "other-arch"),
+                ],
+            )],
+        };
+
+        let (config, selected) = catalog
+            .best_candidate(&DependencyReq::parse("hello>=1.5").unwrap())
+            .unwrap();
+        assert_eq!(config.name, "main");
+        assert_eq!(selected.version, "2.0");
+        assert!(
+            catalog
+                .best_candidate(&DependencyReq::parse("hello>=3.0").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn repository_urls_require_https_and_drop_trailing_slashes() {
         assert_eq!(
             validate_repository_url("https://example.com/arkpkg/").unwrap(),
@@ -537,9 +625,12 @@ mod tests {
     #[test]
     fn package_download_tempfiles_use_the_target_root_cache() {
         let root = TempDir::new().unwrap();
-        let repositories = RepositoryManager::new(root.path());
+        let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
+            repositories: Vec::new(),
+        };
 
-        let temporary = repositories.download_tempfile().unwrap();
+        let temporary = catalog.download_tempfile().unwrap();
 
         assert!(
             temporary.path().starts_with(
@@ -561,9 +652,12 @@ mod tests {
         let cache_parent = root.path().join("var/cache/arkpkg");
         fs::create_dir_all(&cache_parent).unwrap();
         symlink(outside.path(), cache_parent.join("downloads")).unwrap();
-        let repositories = RepositoryManager::new(root.path());
+        let catalog = RepositoryCatalog {
+            root: root.path().to_path_buf(),
+            repositories: Vec::new(),
+        };
 
-        assert!(repositories.download_tempfile().is_err());
+        assert!(catalog.download_tempfile().is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }
