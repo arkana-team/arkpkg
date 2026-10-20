@@ -126,11 +126,7 @@ fn installer_does_not_create_parent_directories_through_out_of_root_symlinks() {
     let archive = output_dir.path().join("pathguard.ark");
     create_ark(pkg_source_dir.path(), &archive).unwrap();
 
-    symlink(
-        outside_root_dir.path(),
-        fake_root_dir.path().join("usr"),
-    )
-    .unwrap();
+    symlink(outside_root_dir.path(), fake_root_dir.path().join("usr")).unwrap();
 
     let db = Database::new(fake_root_dir.path());
     let logger = Logger::new(fake_root_dir.path());
