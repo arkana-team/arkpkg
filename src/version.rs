@@ -9,6 +9,7 @@ use crate::errors::{ArkError, Result};
 enum VersionSegment {
     Number(u64),
     Str(String),
+    Tilde,
 }
 
 impl PartialOrd for VersionSegment {
@@ -20,6 +21,9 @@ impl PartialOrd for VersionSegment {
 impl Ord for VersionSegment {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
+            (VersionSegment::Tilde, VersionSegment::Tilde) => Ordering::Equal,
+            (VersionSegment::Tilde, _) => Ordering::Less,
+            (_, VersionSegment::Tilde) => Ordering::Greater,
             (VersionSegment::Number(a), VersionSegment::Number(b)) => a.cmp(b),
             (VersionSegment::Str(a), VersionSegment::Str(b)) => a.cmp(b),
             // Numbers are considered greater than alphanumeric strings (e.g. 1 > alpha)
@@ -33,6 +37,7 @@ impl Ord for VersionSegment {
 #[derive(Debug, Clone)]
 pub struct Version {
     raw: String,
+    epoch: u64,
     segments: Vec<VersionSegment>,
 }
 
@@ -43,10 +48,29 @@ impl Version {
         if s.is_empty() {
             return Err(ArkError::InvalidPackage("Empty version string".into()));
         }
-        if !s.as_bytes()[0].is_ascii_alphanumeric()
-            || !s
+        let (epoch, version) = match s.split_once(':') {
+            Some((epoch, version)) => {
+                if epoch.is_empty()
+                    || !epoch.bytes().all(|byte| byte.is_ascii_digit())
+                    || version.is_empty()
+                    || version.contains(':')
+                {
+                    return Err(ArkError::InvalidPackage(format!(
+                        "Invalid version string: {}",
+                        s
+                    )));
+                }
+                let epoch = epoch.parse::<u64>().map_err(|_| {
+                    ArkError::InvalidPackage(format!("Invalid version string: {}", s))
+                })?;
+                (epoch, version)
+            }
+            None => (0, s),
+        };
+        if !version.as_bytes()[0].is_ascii_alphanumeric()
+            || !version
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-~".contains(&byte))
         {
             return Err(ArkError::InvalidPackage(format!(
                 "Invalid version string: {}",
@@ -55,14 +79,19 @@ impl Version {
         }
 
         let mut segments = Vec::new();
-        for part in s.split(&['.', '-', '_'][..]) {
-            if part.is_empty() {
-                continue;
+        for (index, tilde_part) in version.split('~').enumerate() {
+            if index > 0 {
+                segments.push(VersionSegment::Tilde);
             }
-            if let Ok(num) = part.parse::<u64>() {
-                segments.push(VersionSegment::Number(num));
-            } else {
-                segments.push(VersionSegment::Str(part.to_string()));
+            for part in tilde_part.split(&['.', '-', '_'][..]) {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Ok(num) = part.parse::<u64>() {
+                    segments.push(VersionSegment::Number(num));
+                } else {
+                    segments.push(VersionSegment::Str(part.to_string()));
+                }
             }
         }
 
@@ -75,6 +104,7 @@ impl Version {
 
         Ok(Self {
             raw: s.to_string(),
+            epoch,
             segments,
         })
     }
@@ -101,12 +131,19 @@ impl PartialOrd for Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
+        let epoch_order = self.epoch.cmp(&other.epoch);
+        if epoch_order != Ordering::Equal {
+            return epoch_order;
+        }
+
         let max_len = self.segments.len().max(other.segments.len());
         for i in 0..max_len {
             let seg1 = self.segments.get(i);
             let seg2 = other.segments.get(i);
 
             match (seg1, seg2) {
+                (Some(VersionSegment::Tilde), None) => return Ordering::Less,
+                (None, Some(VersionSegment::Tilde)) => return Ordering::Greater,
                 (Some(s1), Some(s2)) => {
                     let ord = s1.cmp(s2);
                     if ord != Ordering::Equal {
@@ -278,9 +315,33 @@ mod tests {
         assert_eq!(v1, v2);
         assert!(v1 > v3);
         assert!(v4 > v5); // 41 > 4
-        for invalid in ["../outside", "1/2", "1 0"] {
+        let debian_epoch = Version::parse("1:3.6.27-9").unwrap();
+        assert_eq!(debian_epoch.as_str(), "1:3.6.27-9");
+        assert!(debian_epoch > Version::parse("9.9.99").unwrap());
+        assert!(Version::parse("10:0.1").unwrap() > debian_epoch);
+        assert_eq!(
+            Version::parse("0:1.2").unwrap(),
+            Version::parse("1.2").unwrap()
+        );
+        let repacked_epoch = Version::parse("1:7.10.1+dfsg-1").unwrap();
+        assert_eq!(repacked_epoch.as_str(), "1:7.10.1+dfsg-1");
+        assert!(repacked_epoch > Version::parse("7.10.1+dfsg-1").unwrap());
+        for invalid in ["../outside", "1/2", "1 0", ":1", "1:", "a:1", "1:2:3"] {
             assert!(Version::parse(invalid).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn test_tilde_versions_sort_before_the_release() {
+        let prerelease = Version::parse("1.9.22~dfsg-4").unwrap();
+        let release = Version::parse("1.9.22").unwrap();
+        assert!(prerelease < release);
+        assert!(release > prerelease);
+
+        let epoch_prerelease = Version::parse("1:1.9.22~rc1").unwrap();
+        let epoch_release = Version::parse("1:1.9.22").unwrap();
+        assert!(epoch_prerelease < epoch_release);
+        assert!(Version::parse("2:1.9.22~rc1").unwrap() > epoch_release);
     }
 
     #[test]
