@@ -345,6 +345,7 @@ impl<'a> Installer<'a> {
                 let _ = fs::remove_file(path);
             }
         }
+        crate::linker_cache::refresh_if_needed(self.db.root(), &installed_rel_files, self.logger);
         self.logger.info("DONE");
         Ok(())
     }
