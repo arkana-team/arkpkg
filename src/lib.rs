@@ -4,6 +4,7 @@ pub mod cli;
 pub mod database;
 pub mod errors;
 pub mod installer;
+pub mod linker_cache;
 pub mod logger;
 pub mod metadata;
 pub mod package;

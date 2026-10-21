@@ -214,6 +214,8 @@ impl<'a> Remover<'a> {
             }
         }
 
+        crate::linker_cache::refresh_if_needed(self.db.root(), &arkinfo.files, self.logger);
+
         // 9 & 10. Log transaction and report success
         self.logger.info("DONE");
         Ok(())
