@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
 use crate::checksum::{compute_sha256_file, compute_sha256_path};
-use crate::database::{ArkInfo, Database};
+use crate::database::{ArkInfo, Database, validate_installed_path};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
 use crate::prompt::PromptHandler;
@@ -187,12 +187,13 @@ impl<'a> Installer<'a> {
                 )));
             }
 
+            let install_rel_path = PathBuf::from("/").join(relative);
+            validate_installed_path(&install_rel_path)?;
             let target_path = self.db.root().join(relative);
 
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
                 files_to_install.push((entry.path().to_path_buf(), relative.to_path_buf()));
 
-                let install_rel_path = PathBuf::from("/").join(relative);
                 if path_exists(&target_path)? {
                     if let Some(owner) = file_ownership.get(&install_rel_path) {
                         if owner != &metadata.name {

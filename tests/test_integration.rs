@@ -13,6 +13,72 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
+fn installer_escapes_archive_path_in_logs() {
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: logguard\nDescription: log test\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    fs::create_dir(source.path().join("package")).unwrap();
+    let archive = output.path().join("package\n[forged] INFO DONE\r.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    let log = fs::read_to_string(root.path().join("var/log/arkpkg.log")).unwrap();
+    assert!(log.contains("package\\n[forged] INFO DONE\\r.ark"));
+    assert!(!log.contains("\n[forged]"));
+    assert!(!log.contains('\r'));
+    assert!(db.is_installed("logguard").unwrap().is_some());
+}
+
+#[test]
+fn installer_rejects_unsupported_filenames_before_copying_any_files() {
+    for filename in [
+        "z-last\n[forged] INFO DONE",
+        "z-last\rINFO DONE",
+        "z-last\ttool",
+        "z-last\x1b[2J",
+        "z-last=owner",
+    ] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: logguard\nDescription: log test\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload_dir = source.path().join("package/usr/bin");
+        fs::create_dir_all(&payload_dir).unwrap();
+        fs::write(payload_dir.join("a-first"), b"valid payload").unwrap();
+        fs::write(payload_dir.join(filename), b"invalid payload").unwrap();
+        let archive = output.path().join("logguard.ark");
+        create_ark(source.path(), &archive).unwrap();
+
+        let db = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+        assert!(matches!(
+            installer.install(&archive),
+            Err(ArkError::InvalidPackage(_))
+        ));
+
+        let log = fs::read_to_string(root.path().join("var/log/arkpkg.log")).unwrap();
+        assert!(!log.contains("COPY "), "logged copy for {filename:?}");
+        assert!(!log.contains("[forged]"));
+        assert!(!root.path().join("usr").exists());
+        assert_eq!(db.is_installed("logguard").unwrap(), None);
+    }
+}
+
+#[test]
 fn test_full_package_lifecycle() {
     let pkg_source_dir = TempDir::new().unwrap();
     let fake_root_dir = TempDir::new().unwrap();

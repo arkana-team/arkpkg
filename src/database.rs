@@ -261,7 +261,7 @@ fn validate_file_hashes(files: &[PathBuf], file_hashes: &[(PathBuf, String)]) ->
     Ok(())
 }
 
-fn validate_installed_path(path: &Path) -> Result<()> {
+pub(crate) fn validate_installed_path(path: &Path) -> Result<()> {
     let value = path.to_str().ok_or_else(|| {
         ArkError::InvalidPackage("Installed file paths must be valid UTF-8".into())
     })?;
