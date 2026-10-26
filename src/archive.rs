@@ -52,9 +52,11 @@ pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
                 path.display()
             )));
         }
-        if symlink_paths
-            .iter()
-            .any(|symlink: &PathBuf| path != *symlink && path.starts_with(symlink))
+        // Check only proper ancestors so unrelated symlinks do not add validation work.
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| symlink_paths.contains(ancestor))
         {
             return Err(ArkError::InvalidPackage(format!(
                 "Archive entry '{}' descends through a symlink",
@@ -231,7 +233,7 @@ mod tests {
         header.set_path(path).unwrap();
         header.set_entry_type(entry_type);
         header.set_size(content.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
         header.set_cksum();
         archive.append(&header, content).unwrap();
     }
@@ -337,5 +339,118 @@ Arch: x86_64
         archive.into_inner().unwrap().finish().unwrap();
 
         assert!(extract_ark(&archive_path, extraction_dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracts_many_sibling_symlinks() {
+        let archive_dir = TempDir::new().unwrap();
+        let extraction_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("sibling-symlinks.ark");
+        let output = File::create(&archive_path).unwrap();
+        let mut archive = Builder::new(FrameEncoder::new(output));
+        let metadata = b"Name: siblings\nDescription: test\nVersion: 1.0\nArch: any\n";
+        append_entry(&mut archive, "ARKPKG", tar::EntryType::Regular, metadata);
+        append_entry(&mut archive, "package", tar::EntryType::Directory, b"");
+        append_entry(
+            &mut archive,
+            "package/target",
+            tar::EntryType::Regular,
+            b"payload",
+        );
+        for index in 0..1024 {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            archive
+                .append_link(
+                    &mut header,
+                    format!("package/links/link-{index}"),
+                    "../target",
+                )
+                .unwrap();
+        }
+        // A textual prefix of an entry is not necessarily an ancestor.
+        append_entry(
+            &mut archive,
+            "package/links/link-0-extra/file",
+            tar::EntryType::Regular,
+            b"sibling payload",
+        );
+        archive.into_inner().unwrap().finish().unwrap();
+
+        assert_eq!(
+            extract_ark(&archive_path, extraction_dir.path())
+                .unwrap()
+                .name,
+            "siblings"
+        );
+        for index in 0..1024 {
+            assert_eq!(
+                fs::read_link(
+                    extraction_dir
+                        .path()
+                        .join(format!("package/links/link-{index}"))
+                )
+                .unwrap(),
+                Path::new("../target")
+            );
+        }
+        assert_eq!(
+            fs::read(
+                extraction_dir
+                    .path()
+                    .join("package/links/link-0-extra/file")
+            )
+            .unwrap(),
+            b"sibling payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_descendants_and_duplicate_symlinks() {
+        for (path, expected_error) in [
+            ("package/links/alias/file", "descends through a symlink"),
+            (
+                "package/links/alias/subdir/file",
+                "descends through a symlink",
+            ),
+            ("package/links/alias", "Duplicate archive entry"),
+        ] {
+            let archive_dir = TempDir::new().unwrap();
+            let extraction_dir = TempDir::new().unwrap();
+            let archive_path = archive_dir.path().join("symlink-ancestor.ark");
+            let output = File::create(&archive_path).unwrap();
+            let mut archive = Builder::new(FrameEncoder::new(output));
+            append_entry(&mut archive, "package", tar::EntryType::Directory, b"");
+            append_entry(
+                &mut archive,
+                "package/target",
+                tar::EntryType::Directory,
+                b"",
+            );
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            archive
+                .append_link(&mut header, "package/links/alias", "../target")
+                .unwrap();
+            archive.append_link(&mut header, path, "../target").unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+
+            let error = extract_ark(&archive_path, extraction_dir.path()).unwrap_err();
+            assert!(
+                matches!(error, ArkError::InvalidPackage(message) if message.contains(expected_error))
+            );
+            assert_eq!(
+                fs::read_dir(extraction_dir.path().join("package/target"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
     }
 }
