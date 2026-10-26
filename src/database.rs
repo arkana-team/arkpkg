@@ -1,6 +1,8 @@
+use rustix::fd::{AsFd, OwnedFd};
+use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -323,6 +325,38 @@ fn validate_preserved_files(
     Ok(())
 }
 
+// Only single, fixed path components are passed to this helper.
+fn open_state_directory(parent: &impl AsFd, name: &str) -> io::Result<OwnedFd> {
+    match mkdirat(parent, name, Mode::from_raw_mode(0o777)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// Reject payload files at database paths, including their ancestors and descendants.
+pub(crate) fn validate_payload_path(relative: &Path) -> Result<()> {
+    for reserved in [
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages",
+    ] {
+        let reserved = Path::new(reserved);
+        if relative.starts_with(reserved) || reserved.starts_with(relative) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package file '{}' overlaps reserved database state",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Package and file database manager operating under a root directory.
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -358,20 +392,44 @@ impl Database {
         Ok(self.packages_dir().join(format!("{}.arkinfo", pkg_name)))
     }
 
-    /// Ensures that database directories exist.
+    /// Ensures state directories and regular database files exist without following symlinks.
     pub fn init(&self) -> Result<()> {
-        let db_dir = self.root.join("etc/arkpkg");
-        fs::create_dir_all(&db_dir)?;
-        fs::create_dir_all(self.packages_dir())?;
+        // The caller selects the root; every component beneath it is opened relative
+        // to a verified directory handle so a symlink cannot redirect creation.
+        fs::create_dir_all(&self.root)?;
+        let root = open(
+            &self.root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let etc = open_state_directory(&root, "etc")?;
+        let db_dir = open_state_directory(&etc, "arkpkg")?;
+        open_state_directory(&db_dir, "packages")?;
+        let var = open_state_directory(&root, "var")?;
+        open_state_directory(&var, "log")?;
 
-        let log_dir = self.root.join("var/log");
-        fs::create_dir_all(&log_dir)?;
-
-        if !self.package_db_path().exists() {
-            File::create(self.package_db_path())?;
-        }
-        if !self.file_db_path().exists() {
-            File::create(self.file_db_path())?;
+        for name in ["package.db", "file.db"] {
+            // No truncation, even if another initializer creates the file first.
+            // NONBLOCK lets us reject a FIFO without waiting for a writer.
+            let file = File::from(
+                openat(
+                    &db_dir,
+                    name,
+                    OFlags::RDONLY
+                        | OFlags::CREATE
+                        | OFlags::NOFOLLOW
+                        | OFlags::NONBLOCK
+                        | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o666),
+                )
+                .map_err(io::Error::from)?,
+            );
+            if !file.metadata()?.is_file() {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Database '{name}' is not a regular file"
+                )));
+            }
         }
         Ok(())
     }
@@ -605,6 +663,70 @@ impl Database {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_database_symlinks_without_touching_the_target() {
+        for name in ["package.db", "file.db"] {
+            for existing in [false, true] {
+                let root = TempDir::new().unwrap();
+                let outside = TempDir::new().unwrap();
+                let target = outside.path().join("target");
+                if existing {
+                    fs::write(&target, b"keep me").unwrap();
+                }
+                let db_dir = root.path().join("etc/arkpkg");
+                fs::create_dir_all(&db_dir).unwrap();
+                std::os::unix::fs::symlink(&target, db_dir.join(name)).unwrap();
+
+                assert!(
+                    Database::new(root.path()).init().is_err(),
+                    "accepted {name}"
+                );
+                if existing {
+                    assert_eq!(fs::read(&target).unwrap(), b"keep me");
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_symlinked_state_directories() {
+        for relative in ["etc", "etc/arkpkg", "etc/arkpkg/packages", "var", "var/log"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let link = root.path().join(relative);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+            assert!(
+                Database::new(root.path()).init().is_err(),
+                "accepted {relative}"
+            );
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn init_rejects_non_file_databases() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("etc/arkpkg/package.db")).unwrap();
+        assert!(Database::new(root.path()).init().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rejects_fifo_databases() {
+        let root = TempDir::new().unwrap();
+        let db_dir = root.path().join("etc/arkpkg");
+        fs::create_dir_all(&db_dir).unwrap();
+        let parent = File::open(&db_dir).unwrap();
+        rustix::fs::mkfifoat(&parent, "package.db", Mode::from_raw_mode(0o600)).unwrap();
+        assert!(Database::new(root.path()).init().is_err());
+    }
 
     #[test]
     fn test_database_operations() {

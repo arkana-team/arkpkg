@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
 use crate::checksum::{compute_sha256_file, compute_sha256_path};
-use crate::database::{ArkInfo, Database};
+use crate::database::{ArkInfo, Database, validate_payload_path};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
 use crate::prompt::PromptHandler;
@@ -190,6 +190,7 @@ impl<'a> Installer<'a> {
             let target_path = self.db.root().join(relative);
 
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
+                validate_payload_path(relative)?;
                 files_to_install.push((entry.path().to_path_buf(), relative.to_path_buf()));
 
                 let install_rel_path = PathBuf::from("/").join(relative);
@@ -239,6 +240,13 @@ impl<'a> Installer<'a> {
             if let Some(parent) = dest_path.parent()
                 && let Err(error) = create_destination_parent(self.db.root(), parent)
             {
+                self.rollback(&file_changes);
+                return Err(error);
+            }
+
+            // Resolve the parent after creating/checking it to catch aliases into
+            // database state, including symlinks installed earlier in this package.
+            if let Err(error) = validate_resolved_payload_path(self.db.root(), &dest_path) {
                 self.rollback(&file_changes);
                 return Err(error);
             }
@@ -429,6 +437,22 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_resolved_payload_path(root: &Path, destination: &Path) -> Result<()> {
+    let canonical_root = root.canonicalize()?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| ArkError::InvalidPackage("Install path has no parent directory".into()))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| ArkError::InvalidPackage("Install path has no filename".into()))?;
+    // Do not resolve the final component: installation replaces that entry itself.
+    let resolved = parent.canonicalize()?.join(name);
+    let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+        ArkError::InvalidPackage("Install destination resolves outside target root".into())
+    })?;
+    validate_payload_path(relative)
 }
 
 fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {

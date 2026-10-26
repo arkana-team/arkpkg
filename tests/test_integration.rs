@@ -33,6 +33,13 @@ testpkg=/usr/bin/testpkg
     fs::create_dir_all(&bin_dir).unwrap();
     fs::write(bin_dir.join("testpkg"), b"#!/bin/sh\necho test").unwrap();
 
+    // Neighboring package-manager configuration remains a valid package payload.
+    let config = pkg_source_dir
+        .path()
+        .join("package/etc/arkpkg/package.db.example");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, b"example configuration").unwrap();
+
     let ark_file = output_dir.path().join("testpkg-1.2.3-x86_64.ark");
 
     // 2. Build .ark package
@@ -55,6 +62,11 @@ testpkg=/usr/bin/testpkg
     // Verify files copied to fake-root
     let installed_bin = fake_root_dir.path().join("usr/bin/testpkg");
     assert!(installed_bin.exists());
+    let installed_config = fake_root_dir.path().join("etc/arkpkg/package.db.example");
+    assert_eq!(
+        fs::read(&installed_config).unwrap(),
+        b"example configuration"
+    );
 
     // Verify package.db
     let is_inst = db.is_installed("testpkg").unwrap();
@@ -72,6 +84,7 @@ testpkg=/usr/bin/testpkg
 
     // Verify binary removed
     assert!(!installed_bin.exists());
+    assert!(!installed_config.exists());
 
     // Verify package.db updated
     assert_eq!(db.is_installed("testpkg").unwrap(), None);
@@ -371,4 +384,71 @@ fn remover_warns_before_breaking_installed_dependents() {
     confirm_remove.remove("basepkg").unwrap();
     assert_eq!(db.is_installed("basepkg").unwrap(), None);
     assert!(db.is_installed("dependent").unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_database_payloads_even_with_force() {
+    use std::os::unix::fs::symlink;
+
+    for relative in [
+        "etc",
+        "etc/arkpkg",
+        "etc/arkpkg/packages",
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages/other.arkinfo",
+        "state-alias/package.db",
+        "state-alias/file.db",
+        "state-alias/packages/other.arkinfo",
+    ] {
+        for link_payload in [false, true] {
+            let source = TempDir::new().unwrap();
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let output = TempDir::new().unwrap();
+            let target = outside.path().join("must-not-be-created");
+            fs::write(
+                source.path().join("ARKPKG"),
+                "Name: stateattack\nDescription: reserved state test\nVersion: 1.0\nArch: any\n",
+            )
+            .unwrap();
+            let payload = source.path().join("package").join(relative);
+            fs::create_dir_all(payload.parent().unwrap()).unwrap();
+            if link_payload {
+                symlink(&target, &payload).unwrap();
+            } else {
+                fs::write(&payload, b"replacement").unwrap();
+            }
+            let archive = output.path().join("attack.ark");
+            create_ark(source.path(), &archive).unwrap();
+            let db = Database::new(root.path());
+            db.init().unwrap();
+            db.add_installed_package("existing", &Version::parse("1.0").unwrap())
+                .unwrap();
+            db.add_file_ownership(&[PathBuf::from("/usr/bin/existing")], "existing")
+                .unwrap();
+            let db_dir = root.path().join("etc/arkpkg");
+            let info_path = db_dir.join("packages/other.arkinfo");
+            fs::write(&info_path, b"original metadata").unwrap();
+            let package_before = fs::read(db_dir.join("package.db")).unwrap();
+            let file_before = fs::read(db_dir.join("file.db")).unwrap();
+            symlink("etc/arkpkg", root.path().join("state-alias")).unwrap();
+            let logger = Logger::new(root.path());
+            let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+            assert!(
+                matches!(
+                    installer.install(&archive),
+                    Err(ArkError::InvalidPackage(_))
+                ),
+                "accepted {relative} (symlink: {link_payload})"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read(db_dir.join("package.db")).unwrap(), package_before);
+            assert_eq!(fs::read(db_dir.join("file.db")).unwrap(), file_before);
+            assert_eq!(fs::read(&info_path).unwrap(), b"original metadata");
+            assert!(!db_dir.join("packages/stateattack.arkinfo").exists());
+        }
+    }
 }
