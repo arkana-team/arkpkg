@@ -5,7 +5,11 @@ use std::path::Path;
 
 /// Computes the SHA-256 hash of a file at the given path.
 pub fn compute_sha256_file<P: AsRef<Path>>(path: P) -> IoResult<String> {
-    let mut file = File::open(path)?;
+    compute_sha256_reader(File::open(path)?)
+}
+
+/// Hash an already opened file without resolving its pathname again.
+pub(crate) fn compute_sha256_reader(mut file: impl Read) -> IoResult<String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
 

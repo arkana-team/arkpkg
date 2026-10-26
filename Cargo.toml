@@ -36,6 +36,7 @@ simplelog = "0.12"
 thiserror = "1.0"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2.5"
+cap-std = "4.0.3"
 
 [profile.release]
 opt-level = 3

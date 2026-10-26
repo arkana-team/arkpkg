@@ -202,6 +202,44 @@ fn failed_install_restores_preexisting_files() {
     assert_eq!(db.is_installed("rollbacktest").unwrap(), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn installer_accepts_parent_symlinks_resolving_inside_the_root() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: parentlinks\nDescription: in-root directory links\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    for path in ["bin/relative/tool", "absolute/nested/tool"] {
+        let payload = source.path().join("package").join(path);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(payload, b"package content").unwrap();
+    }
+    fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+    symlink("usr/bin", root.path().join("bin")).unwrap();
+    symlink(root.path().join("usr/bin"), root.path().join("absolute")).unwrap();
+    let archive = output.path().join("parentlinks.ark");
+    create_ark(source.path(), &archive).unwrap();
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    logger.init().unwrap();
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    for path in ["usr/bin/relative/tool", "usr/bin/nested/tool"] {
+        assert_eq!(
+            fs::read(root.path().join(path)).unwrap(),
+            b"package content"
+        );
+    }
+    Verifier::new(&db).verify("parentlinks").unwrap();
+}
+
 #[test]
 fn removing_package_restores_untracked_file_replaced_during_install() {
     let pkg_source_dir = TempDir::new().unwrap();

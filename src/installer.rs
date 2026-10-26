@@ -1,12 +1,15 @@
-use std::collections::HashSet;
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Seek};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
-use crate::checksum::{compute_sha256_file, compute_sha256_path};
+use crate::checksum::{compute_sha256_file, compute_sha256_reader};
 use crate::database::{ArkInfo, Database};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
@@ -229,58 +232,69 @@ impl<'a> Installer<'a> {
         // 12. Install files with backups so failures preserve overwritten files.
         self.logger.info("Copying files into installation root");
         let pkg_checksum = compute_sha256_file(ark_path)?;
-        let mut file_changes: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let install_root = Dir::open_ambient_dir(self.db.root(), ambient_authority())?;
+        let canonical_root = self.db.root().canonicalize()?;
+        let mut destination_parents = HashMap::new();
+        let mut file_changes: Vec<FileChange> = Vec::new();
         let mut installed_rel_files = Vec::new();
         let mut file_hashes = Vec::new();
         let mut preserved_files = Vec::new();
 
         for (src_path, rel_path) in &files_to_install {
-            let dest_path = self.db.root().join(rel_path);
-            if let Some(parent) = dest_path.parent()
-                && let Err(error) = create_destination_parent(self.db.root(), parent)
-            {
-                self.rollback(&file_changes);
-                return Err(error);
-            }
+            let relative_parent = rel_path.parent().unwrap();
+            // Share one handle per destination directory across its files.
+            let parent = match destination_parents.entry(relative_parent.to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(entry) => Rc::clone(entry.get()),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let parent = match create_destination_parent(
+                        &install_root,
+                        &canonical_root,
+                        relative_parent,
+                    ) {
+                        Ok(parent) => Rc::new(parent),
+                        Err(error) => {
+                            self.rollback(&file_changes);
+                            return Err(error);
+                        }
+                    };
+                    Rc::clone(entry.insert(parent))
+                }
+            };
+            let name = PathBuf::from(rel_path.file_name().unwrap());
 
-            let backup = match backup_existing_file(&dest_path) {
+            let backup = match backup_existing_file(&parent, &name, temp_dir.path()) {
                 Ok(backup) => backup,
                 Err(error) => {
                     self.rollback(&file_changes);
                     return Err(error);
                 }
             };
-            file_changes.push((dest_path.clone(), backup.clone()));
+            file_changes.push(FileChange {
+                parent,
+                name,
+                relative: rel_path.clone(),
+                backup: backup.clone(),
+            });
             let install_rel_path = PathBuf::from("/").join(rel_path);
             if let Some(backup_path) = backup.as_ref()
                 && untracked_conflicts.contains(&install_rel_path)
             {
-                let backup_rel_path = match backup_path.strip_prefix(self.db.root()) {
-                    Ok(path) => PathBuf::from("/").join(path),
-                    Err(error) => {
-                        self.rollback(&file_changes);
-                        return Err(ArkError::Generic(format!(
-                            "Could not record overwritten file backup: {error}"
-                        )));
-                    }
-                };
+                let backup_rel_path = PathBuf::from("/").join(rel_path.with_file_name(backup_path));
                 preserved_files.push((install_rel_path, backup_rel_path));
             }
             self.logger
                 .action("COPY", &format!("/{}", rel_path.display()));
 
-            if let Err(error) = install_package_file(src_path, &dest_path, rel_path) {
-                self.rollback(&file_changes);
-                return Err(error);
-            }
+            let change = file_changes.last().unwrap();
+            let file_hash =
+                match install_package_file(src_path, &change.parent, &change.name, rel_path) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        self.rollback(&file_changes);
+                        return Err(error);
+                    }
+                };
             let installed_path = PathBuf::from("/").join(rel_path);
-            let file_hash = match compute_sha256_path(&dest_path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    self.rollback(&file_changes);
-                    return Err(ArkError::Io(error));
-                }
-            };
             file_hashes.push((installed_path.clone(), file_hash));
             installed_rel_files.push(installed_path);
         }
@@ -330,19 +344,14 @@ impl<'a> Installer<'a> {
             return Err(error);
         }
 
-        let preserved_backup_paths: HashSet<PathBuf> = preserved_files
-            .iter()
-            .map(|(_, backup)| {
-                self.db
-                    .root()
-                    .join(backup.strip_prefix("/").unwrap_or(backup))
-            })
-            .collect();
-        for (_, backup) in &file_changes {
-            if let Some(path) = backup
-                && !preserved_backup_paths.contains(path)
+        let preserved_backup_paths: HashSet<&PathBuf> =
+            preserved_files.iter().map(|(_, backup)| backup).collect();
+        for change in &file_changes {
+            if let Some(backup) = &change.backup
+                && !preserved_backup_paths
+                    .contains(&PathBuf::from("/").join(change.relative.with_file_name(backup)))
             {
-                let _ = fs::remove_file(path);
+                let _ = change.parent.remove_file(backup);
             }
         }
         crate::linker_cache::refresh_if_needed(self.db.root(), &installed_rel_files, self.logger);
@@ -351,14 +360,26 @@ impl<'a> Installer<'a> {
     }
 
     /// Restore pre-existing files and remove files from a failed installation.
-    fn rollback(&self, file_changes: &[(PathBuf, Option<PathBuf>)]) {
-        for (path, backup) in file_changes.iter().rev() {
-            if path_exists(path).unwrap_or(false) {
-                let _ = fs::remove_file(path);
-            }
-            if let Some(backup_path) = backup {
-                let _ = fs::rename(backup_path, path);
-            }
+    fn rollback(&self, file_changes: &[FileChange]) {
+        for change in file_changes.iter().rev() {
+            change.rollback();
+        }
+    }
+}
+
+// Keep the exact parent used for installation alive through cleanup or rollback.
+struct FileChange {
+    parent: Rc<Dir>,
+    name: PathBuf,
+    relative: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl FileChange {
+    fn rollback(&self) {
+        let _ = self.parent.remove_file(&self.name);
+        if let Some(backup) = &self.backup {
+            let _ = self.parent.rename(backup, &self.parent, &self.name);
         }
     }
 }
@@ -371,16 +392,13 @@ fn path_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
-    let canonical_root = root.canonicalize()?;
-    let relative_parent = parent.strip_prefix(root).map_err(|error| {
-        ArkError::InvalidPackage(format!(
-            "Install destination '{}' is not beneath target root '{}': {error}",
-            parent.display(),
-            root.display()
-        ))
-    })?;
-    let mut current = root.to_path_buf();
+fn create_destination_parent(
+    root: &Dir,
+    canonical_root: &Path,
+    relative_parent: &Path,
+) -> Result<Dir> {
+    let mut current = canonical_root.to_path_buf();
+    let mut directory = root.try_clone()?;
 
     for component in relative_parent.components() {
         let Component::Normal(name) = component else {
@@ -394,13 +412,13 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
-                    Ok(()) => fs::symlink_metadata(&current)?,
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        fs::symlink_metadata(&current)?
-                    }
+                match directory.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(ArkError::Io(error)),
                 }
+                directory = directory.open_dir(name)?;
+                continue;
             }
             Err(error) => return Err(ArkError::Io(error)),
         };
@@ -413,26 +431,29 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
         }
 
         let canonical_current = current.canonicalize()?;
-        if !canonical_current.starts_with(&canonical_root) {
+        if !canonical_current.starts_with(canonical_root) {
             return Err(ArkError::InvalidPackage(format!(
                 "Install destination '{}' resolves outside target root '{}'",
                 canonical_current.display(),
                 canonical_root.display()
             )));
         }
-        if !canonical_current.is_dir() {
-            return Err(ArkError::PackageConflict(format!(
-                "Install parent '{}' does not resolve to a directory",
-                current.display()
-            )));
-        }
+        // Canonicalization preserves existing in-root symlinks (including absolute
+        // ones). It is only a name translation: Dir enforces containment again
+        // while opening the translated path, even if an ancestor was replaced.
+        let relative = canonical_current.strip_prefix(canonical_root).unwrap();
+        directory = root.open_dir(if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        })?;
     }
 
-    Ok(())
+    Ok(directory)
 }
 
-fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {
-    let metadata = match fs::symlink_metadata(path) {
+fn backup_existing_file(parent: &Dir, name: &Path, staging: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match parent.symlink_metadata(name) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ArkError::Io(error)),
@@ -440,18 +461,30 @@ fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {
     if metadata.file_type().is_dir() {
         return Err(ArkError::PackageConflict(format!(
             "Cannot replace directory '{}' with a package file",
-            path.display()
+            name.display()
         )));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| ArkError::InvalidPackage("Install path has no parent directory".into()))?;
-    let temporary = NamedTempFile::new_in(parent)?;
-    fs::rename(path, temporary.path())?;
-    let (_, backup_path) = temporary
-        .keep()
-        .map_err(|error| ArkError::Io(error.error))?;
-    Ok(Some(backup_path))
+    // Generate a random name in private staging, then reserve it exclusively in
+    // the opened destination directory. Rename never follows the final symlink.
+    let temporary = NamedTempFile::new_in(staging)?;
+    let backup = PathBuf::from(temporary.path().file_name().unwrap());
+    create_new_file(parent, &backup)?;
+    if let Err(error) = parent.rename(name, parent, &backup) {
+        let _ = parent.remove_file(&backup);
+        return Err(ArkError::Io(error));
+    }
+    Ok(Some(backup))
+}
+
+fn create_new_file(parent: &Dir, name: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(parent.open_with(name, &options)?.into_std())
 }
 
 fn safe_symlink_target(link_path: &Path, target: &Path) -> bool {
@@ -475,7 +508,12 @@ fn safe_symlink_target(link_path: &Path, target: &Path) -> bool {
     true
 }
 
-fn install_package_file(source: &Path, destination: &Path, relative: &Path) -> Result<()> {
+fn install_package_file(
+    source: &Path,
+    parent: &Dir,
+    name: &Path,
+    relative: &Path,
+) -> Result<String> {
     if fs::symlink_metadata(source)?.file_type().is_symlink() {
         let target = fs::read_link(source)?;
         if !safe_symlink_target(relative, &target) {
@@ -485,14 +523,161 @@ fn install_package_file(source: &Path, destination: &Path, relative: &Path) -> R
             )));
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(target, destination)?;
+        {
+            use std::os::unix::ffi::OsStrExt;
+            parent.symlink_contents(&target, name)?;
+            Ok(crate::checksum::compute_sha256_bytes(
+                target.as_os_str().as_bytes(),
+            ))
+        }
         #[cfg(not(unix))]
         return Err(ArkError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
             "package symlinks require a Unix host",
         )));
     } else {
-        fs::copy(source, destination)?;
+        let mut source = fs::File::open(source)?;
+        // Exclusive creation rejects an entry substituted after backup, including
+        // a symlink or hard link. Copy, chmod and hash all use this same file.
+        let mut destination = create_new_file(parent, name)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.set_permissions(source.metadata()?.permissions())?;
+        destination.rewind()?;
+        Ok(compute_sha256_reader(destination)?)
     }
-    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::checksum::compute_sha256_bytes;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use tempfile::TempDir;
+
+    #[test]
+    fn replacing_the_root_path_cannot_redirect_directory_creation() {
+        let container = TempDir::new().unwrap();
+        let root = container.path().join("root");
+        let moved_root = container.path().join("moved-root");
+        let outside = TempDir::new().unwrap();
+        fs::create_dir(&root).unwrap();
+        let opened_root = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        fs::rename(&root, &moved_root).unwrap();
+        symlink(outside.path(), &root).unwrap();
+
+        create_destination_parent(&opened_root, &root, Path::new("new/deep")).unwrap();
+
+        assert!(moved_root.join("new/deep").is_dir());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ancestor_replacement_cannot_redirect_backup_copy_or_rollback() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::create_dir(outside.path().join("bin")).unwrap();
+        fs::write(root.path().join("usr/bin/tool"), b"original").unwrap();
+        fs::write(outside.path().join("bin/tool"), b"outside").unwrap();
+        let source = staging.path().join("payload");
+        fs::write(&source, b"package").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+        let opened_root = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let parent =
+            create_destination_parent(&opened_root, root.path(), Path::new("usr/bin")).unwrap();
+
+        // Deterministically replace the checked ancestor before the actual I/O.
+        fs::rename(root.path().join("usr"), root.path().join("original-usr")).unwrap();
+        symlink(outside.path(), root.path().join("usr")).unwrap();
+        let name = PathBuf::from("tool");
+        let backup = backup_existing_file(&parent, &name, staging.path()).unwrap();
+        let hash =
+            install_package_file(&source, &parent, &name, Path::new("usr/bin/tool")).unwrap();
+        assert_eq!(hash, compute_sha256_bytes(b"package"));
+        let installed = root.path().join("original-usr/bin/tool");
+        assert_eq!(fs::read(&installed).unwrap(), b"package");
+        assert_eq!(
+            fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+
+        let change = FileChange {
+            parent: Rc::new(parent),
+            name,
+            relative: PathBuf::from("usr/bin/tool"),
+            backup,
+        };
+        change.rollback();
+        assert_eq!(fs::read(installed).unwrap(), b"original");
+        assert_eq!(
+            fs::read(outside.path().join("bin/tool")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(fs::read_dir(outside.path().join("bin")).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(root.path().join("original-usr/bin"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn substituted_final_symlinks_and_hard_links_are_not_written() {
+        let root = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let outside = staging.path().join("outside");
+        let source = staging.path().join("payload");
+        fs::write(&outside, b"outside").unwrap();
+        fs::write(&source, b"package").unwrap();
+        let parent = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let name = Path::new("tool");
+
+        // These entries model substitutions after backup, before file creation.
+        symlink(&outside, root.path().join(name)).unwrap();
+        assert!(install_package_file(&source, &parent, name, name).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        parent.remove_file(name).unwrap();
+        fs::hard_link(&outside, root.path().join(name)).unwrap();
+        assert!(install_package_file(&source, &parent, name, name).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn ancestor_replacement_cannot_redirect_symlink_install_or_backup_cleanup() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("bin")).unwrap();
+        fs::write(root.path().join("bin/tool"), b"original").unwrap();
+        let opened_root = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let parent =
+            create_destination_parent(&opened_root, root.path(), Path::new("bin")).unwrap();
+        let backup = backup_existing_file(&parent, Path::new("tool"), staging.path())
+            .unwrap()
+            .unwrap();
+        fs::write(outside.path().join(&backup), b"outside backup").unwrap();
+        let source = staging.path().join("payload");
+        symlink("/usr/lib/tool", &source).unwrap();
+
+        fs::rename(root.path().join("bin"), root.path().join("original-bin")).unwrap();
+        symlink(outside.path(), root.path().join("bin")).unwrap();
+        assert_eq!(
+            install_package_file(&source, &parent, Path::new("tool"), Path::new("bin/tool"))
+                .unwrap(),
+            compute_sha256_bytes(b"/usr/lib/tool")
+        );
+        assert_eq!(
+            fs::read_link(root.path().join("original-bin/tool")).unwrap(),
+            Path::new("/usr/lib/tool")
+        );
+        parent.remove_file(&backup).unwrap();
+        assert!(!root.path().join("original-bin").join(&backup).exists());
+        assert_eq!(
+            fs::read(outside.path().join(backup)).unwrap(),
+            b"outside backup"
+        );
+        assert!(!outside.path().join("tool").exists());
+    }
 }
