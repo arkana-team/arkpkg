@@ -351,18 +351,32 @@ impl RepositoryManager {
 }
 
 fn rooted_download_tempfile(root: &Path) -> Result<NamedTempFile> {
-    let cache_dir = root.join("var/cache/arkpkg/downloads");
-    fs::create_dir_all(&cache_dir)?;
     let canonical_root = root.canonicalize()?;
-    let canonical_cache = cache_dir.canonicalize()?;
-    if !canonical_cache.starts_with(&canonical_root) {
-        return Err(ArkError::InvalidPackage(format!(
-            "Package download cache '{}' resolves outside target root '{}'",
-            canonical_cache.display(),
-            canonical_root.display()
-        )));
+    let mut cache_dir = canonical_root.clone();
+    for component in ["var", "cache", "arkpkg", "downloads"] {
+        cache_dir.push(component);
+        // Check each existing component before creating anything beneath it.
+        match fs::create_dir(&cache_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        cache_dir = cache_dir.canonicalize()?;
+        if !cache_dir.starts_with(&canonical_root) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package download cache '{}' resolves outside target root '{}'",
+                cache_dir.display(),
+                canonical_root.display()
+            )));
+        }
+        if !cache_dir.is_dir() {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package download cache '{}' is not a directory",
+                cache_dir.display()
+            )));
+        }
     }
-    Ok(NamedTempFile::new_in(canonical_cache)?)
+    Ok(NamedTempFile::new_in(cache_dir)?)
 }
 
 fn validate_repository_url(value: &str) -> Result<String> {
@@ -647,17 +661,91 @@ mod tests {
     fn package_download_cache_rejects_symlinks_outside_the_target_root() {
         use std::os::unix::fs::symlink;
 
+        for component in [
+            "var",
+            "var/cache",
+            "var/cache/arkpkg",
+            "var/cache/arkpkg/downloads",
+        ] {
+            for dangling in [false, true] {
+                let root = TempDir::new().unwrap();
+                let outside = TempDir::new().unwrap();
+                let target = if dangling {
+                    outside.path().join("missing")
+                } else {
+                    outside.path().to_path_buf()
+                };
+                let link = root.path().join(component);
+                fs::create_dir_all(link.parent().unwrap()).unwrap();
+                symlink(target, link).unwrap();
+
+                assert!(rooted_download_tempfile(root.path()).is_err());
+                assert_eq!(
+                    fs::read_dir(outside.path()).unwrap().count(),
+                    0,
+                    "{component}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_download_cache_rejects_installed_absolute_symlink_before_creating_children() {
+        use crate::archive::create_ark;
+        use crate::database::Database;
+        use crate::installer::Installer;
+        use crate::logger::Logger;
+        use crate::prompt::PromptHandler;
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let cache_parent = root.path().join("var/cache/arkpkg");
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: cachelink\nDescription: cache symlink\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let cache_parent = source.path().join("package/var/cache");
         fs::create_dir_all(&cache_parent).unwrap();
-        symlink(outside.path(), cache_parent.join("downloads")).unwrap();
-        let catalog = RepositoryCatalog {
-            root: root.path().to_path_buf(),
-            repositories: Vec::new(),
-        };
+        symlink(outside.path(), cache_parent.join("arkpkg")).unwrap();
+        let archive = source.path().join("cachelink.ark");
+        create_ark(source.path(), &archive).unwrap();
+        let database = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        logger.init().unwrap();
+        let mut installer =
+            Installer::new(&database, &logger, PromptHandler::new(true, false, false));
+        installer.install(&archive).unwrap();
 
-        assert!(catalog.download_tempfile().is_err());
+        assert_eq!(
+            fs::read_link(root.path().join("var/cache/arkpkg")).unwrap(),
+            outside.path()
+        );
+        assert!(rooted_download_tempfile(root.path()).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_download_cache_allows_symlinks_inside_the_target_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("cache-storage")).unwrap();
+        fs::create_dir(root.path().join("var")).unwrap();
+        symlink("../cache-storage", root.path().join("var/cache")).unwrap();
+
+        let mut temporary = rooted_download_tempfile(root.path()).unwrap();
+        temporary.write_all(b"download").unwrap();
+        assert_eq!(fs::read(temporary.path()).unwrap(), b"download");
+        assert_eq!(
+            temporary.path().parent().unwrap(),
+            root.path()
+                .join("cache-storage/arkpkg/downloads")
+                .canonicalize()
+                .unwrap()
+        );
     }
 }
