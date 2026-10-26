@@ -10,7 +10,7 @@ use arkpkg::installer::Installer;
 use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
 use arkpkg::remover::Remover;
-use arkpkg::repository::RepositoryManager;
+use arkpkg::repository::{RepositoryManager, RepositoryPackage};
 use arkpkg::resolver::resolve_install_plan;
 use arkpkg::verifier::Verifier;
 
@@ -83,10 +83,7 @@ fn run() -> Result<()> {
                 }
             }
             for (repo_name, package) in repositories.search(&query, None)? {
-                println!(
-                    "{} {} [{}] ({}) - {}",
-                    package.name, package.version, package.arch, repo_name, package.description
-                );
+                println!("{}", format_repository_search_result(&repo_name, &package));
             }
         }
         Commands::Repo { command } => match command {
@@ -113,6 +110,23 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn format_repository_search_result(repo_name: &str, package: &RepositoryPackage) -> String {
+    let result = format!(
+        "{} {} [{}] ({}) - {}",
+        package.name, package.version, package.arch, repo_name, package.description
+    );
+    let mut escaped = String::with_capacity(result.len());
+    // Repository text must not execute terminal controls or inject result lines.
+    for character in result.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 fn main() {
     // Set clean panic hook to avoid displaying raw Rust panic messages to users
     std::panic::set_hook(Box::new(|info| {
@@ -122,5 +136,65 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("{}", err);
         process::exit(err.exit_code());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package() -> RepositoryPackage {
+        serde_json::from_str(
+            r#"{
+                "name": "hello",
+                "version": "1.2.3",
+                "arch": "any",
+                "description": "hello package",
+                "file": "packages/hello.ark",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repository_search_escapes_controls_decoded_from_json() {
+        let mut package = package();
+        package.description = serde_json::from_str(
+            r#""hello\u001b[2J\u001b[H\r\nforged 9.9 [installed]\t\b\u001b]0;title\u0007\u009b2J""#,
+        )
+        .unwrap();
+        assert!(package.description.contains('\u{1b}'));
+        assert_eq!(
+            format_repository_search_result("main", &package),
+            r"hello 1.2.3 [any] (main) - hello\u{1b}[2J\u{1b}[H\r\nforged 9.9 [installed]\t\u{8}\u{1b}]0;title\u{7}\u{9b}2J"
+        );
+    }
+
+    #[test]
+    fn repository_search_escapes_all_c0_and_c1_controls() {
+        let mut package = package();
+        package.description = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}').collect();
+        // Version validation trims whitespace without changing the index string.
+        package.version = "\n1.2.3\r".into();
+        let result = format_repository_search_result("main", &package);
+        assert!(!result.chars().any(char::is_control));
+        assert!(result.starts_with(r"hello \n1.2.3\r [any] (main) - "));
+    }
+
+    #[test]
+    fn repository_search_preserves_printable_text() {
+        let mut package = package();
+        for description in [
+            "",
+            r#"A "quoted" path: C:\bin; it's useful!"#,
+            "Café 日本語 🦀",
+        ] {
+            package.description = description.into();
+            assert_eq!(
+                format_repository_search_result("main", &package),
+                format!("hello 1.2.3 [any] (main) - {description}")
+            );
+        }
     }
 }
