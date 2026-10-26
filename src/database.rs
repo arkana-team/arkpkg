@@ -364,8 +364,7 @@ impl Database {
         fs::create_dir_all(&db_dir)?;
         fs::create_dir_all(self.packages_dir())?;
 
-        let log_dir = self.root.join("var/log");
-        fs::create_dir_all(&log_dir)?;
+        crate::logger::Logger::new(&self.root).init()?;
 
         if !self.package_db_path().exists() {
             File::create(self.package_db_path())?;

@@ -69,6 +69,7 @@ dependencies = [
  "clap",
  "log",
  "lz4_flex",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
