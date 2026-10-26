@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -161,7 +161,26 @@ impl<'a> Installer<'a> {
         self.logger.info("Checking file conflicts");
         let pkg_files_root = temp_dir.path().join("package");
         let mut file_ownership = self.db.read_file_ownership()?;
+        let canonical_root = self.db.root().canonicalize()?;
+        // Normalize legacy ownership records too, without following the final symlink.
+        let mut resolved_ownership = HashMap::new();
+        for (path, owner) in &file_ownership {
+            let destination = resolve_destination(
+                &canonical_root,
+                path.strip_prefix("/").unwrap_or(path),
+                false,
+            )?;
+            if let Some(previous) = resolved_ownership.insert(destination, owner.clone())
+                && previous != *owner
+            {
+                return Err(ArkError::PackageConflict(format!(
+                    "Multiple packages own the destination of '{}'",
+                    path.display()
+                )));
+            }
+        }
 
+        let mut destinations = HashSet::new();
         let mut files_to_install = Vec::new();
         let mut conflicts_to_prompt = Vec::new();
 
@@ -187,26 +206,29 @@ impl<'a> Installer<'a> {
                 )));
             }
 
-            let target_path = self.db.root().join(relative);
-
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
-                files_to_install.push((entry.path().to_path_buf(), relative.to_path_buf()));
-
-                let install_rel_path = PathBuf::from("/").join(relative);
-                if path_exists(&target_path)? {
-                    if let Some(owner) = file_ownership.get(&install_rel_path) {
-                        if owner != &metadata.name {
-                            return Err(ArkError::PackageConflict(format!(
-                                "File '{}' is already owned by package '{}'",
-                                install_rel_path.display(),
-                                owner
-                            )));
-                        }
-                    } else {
-                        conflicts_to_prompt
-                            .push((install_rel_path.clone(), "untracked".to_string()));
-                    }
+                let destination = resolve_destination(&canonical_root, relative, false)?;
+                if !destinations.insert(destination.clone()) {
+                    return Err(ArkError::InvalidPackage(format!(
+                        "Multiple package files resolve to '{}'",
+                        destination.display()
+                    )));
                 }
+                let install_rel_path =
+                    PathBuf::from("/").join(destination.strip_prefix(&canonical_root).unwrap());
+                if check_file_conflict(
+                    &destination,
+                    &install_rel_path,
+                    &resolved_ownership,
+                    &metadata.name,
+                )? {
+                    conflicts_to_prompt.push((install_rel_path, "untracked".to_string()));
+                }
+                files_to_install.push((
+                    entry.path().to_path_buf(),
+                    relative.to_path_buf(),
+                    destination,
+                ));
             }
         }
 
@@ -220,7 +242,7 @@ impl<'a> Installer<'a> {
                 return Err(ArkError::UserCancelled);
             }
         }
-        let untracked_conflicts: HashSet<PathBuf> = conflicts_to_prompt
+        let mut untracked_conflicts: HashSet<PathBuf> = conflicts_to_prompt
             .iter()
             .filter(|(_, owner)| owner == "untracked")
             .map(|(path, _)| path.clone())
@@ -234,14 +256,42 @@ impl<'a> Installer<'a> {
         let mut file_hashes = Vec::new();
         let mut preserved_files = Vec::new();
 
-        for (src_path, rel_path) in &files_to_install {
-            let dest_path = self.db.root().join(rel_path);
-            if let Some(parent) = dest_path.parent()
-                && let Err(error) = create_destination_parent(self.db.root(), parent)
-            {
-                self.rollback(&file_changes);
-                return Err(error);
-            }
+        for (src_path, rel_path, planned_destination) in &files_to_install {
+            let prepared = (|| -> Result<_> {
+                let destination = resolve_destination(&canonical_root, rel_path, true)?;
+                if destination != *planned_destination {
+                    return Err(ArkError::InvalidPackage(format!(
+                        "Install destination for '{}' changed during installation",
+                        rel_path.display()
+                    )));
+                }
+                let installed_path =
+                    PathBuf::from("/").join(destination.strip_prefix(&canonical_root).unwrap());
+                // Recheck the actual destination immediately before backing it up.
+                let untracked = check_file_conflict(
+                    &destination,
+                    &installed_path,
+                    &resolved_ownership,
+                    &metadata.name,
+                )?;
+                if untracked && !untracked_conflicts.contains(&installed_path) {
+                    if !self.prompt.ask(&format!(
+                        "The file already exists:\n{}\nOwned by package:\nuntracked\nOverwrite?",
+                        installed_path.display()
+                    ))? {
+                        return Err(ArkError::UserCancelled);
+                    }
+                    untracked_conflicts.insert(installed_path.clone());
+                }
+                Ok((destination, installed_path, untracked))
+            })();
+            let (dest_path, install_rel_path, untracked) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.rollback(&file_changes);
+                    return Err(error);
+                }
+            };
 
             let backup = match backup_existing_file(&dest_path) {
                 Ok(backup) => backup,
@@ -251,11 +301,10 @@ impl<'a> Installer<'a> {
                 }
             };
             file_changes.push((dest_path.clone(), backup.clone()));
-            let install_rel_path = PathBuf::from("/").join(rel_path);
             if let Some(backup_path) = backup.as_ref()
-                && untracked_conflicts.contains(&install_rel_path)
+                && untracked
             {
-                let backup_rel_path = match backup_path.strip_prefix(self.db.root()) {
+                let backup_rel_path = match backup_path.strip_prefix(&canonical_root) {
                     Ok(path) => PathBuf::from("/").join(path),
                     Err(error) => {
                         self.rollback(&file_changes);
@@ -264,16 +313,17 @@ impl<'a> Installer<'a> {
                         )));
                     }
                 };
-                preserved_files.push((install_rel_path, backup_rel_path));
+                preserved_files.push((install_rel_path.clone(), backup_rel_path));
             }
             self.logger
                 .action("COPY", &format!("/{}", rel_path.display()));
 
-            if let Err(error) = install_package_file(src_path, &dest_path, rel_path) {
+            let resolved_relative = install_rel_path.strip_prefix("/").unwrap();
+            if let Err(error) = install_package_file(src_path, &dest_path, resolved_relative) {
                 self.rollback(&file_changes);
                 return Err(error);
             }
-            let installed_path = PathBuf::from("/").join(rel_path);
+            let installed_path = install_rel_path;
             let file_hash = match compute_sha256_path(&dest_path) {
                 Ok(hash) => hash,
                 Err(error) => {
@@ -332,11 +382,7 @@ impl<'a> Installer<'a> {
 
         let preserved_backup_paths: HashSet<PathBuf> = preserved_files
             .iter()
-            .map(|(_, backup)| {
-                self.db
-                    .root()
-                    .join(backup.strip_prefix("/").unwrap_or(backup))
-            })
+            .map(|(_, backup)| canonical_root.join(backup.strip_prefix("/").unwrap_or(backup)))
             .collect();
         for (_, backup) in &file_changes {
             if let Some(path) = backup
@@ -371,22 +417,19 @@ fn path_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
-    let canonical_root = root.canonicalize()?;
-    let relative_parent = parent.strip_prefix(root).map_err(|error| {
-        ArkError::InvalidPackage(format!(
-            "Install destination '{}' is not beneath target root '{}': {error}",
-            parent.display(),
-            root.display()
-        ))
-    })?;
+/// Resolve only parent components: a final symlink is replaced, not followed.
+/// Missing parents can be planned without creating them during conflict checks.
+fn resolve_destination(root: &Path, relative: &Path, create_parent: bool) -> Result<PathBuf> {
+    let parent = relative
+        .parent()
+        .ok_or_else(|| ArkError::InvalidPackage("Install path has no parent directory".into()))?;
     let mut current = root.to_path_buf();
 
-    for component in relative_parent.components() {
+    for component in parent.components() {
         let Component::Normal(name) = component else {
             return Err(ArkError::InvalidPackage(format!(
                 "Unsafe install parent path '{}'",
-                relative_parent.display()
+                parent.display()
             )));
         };
         current.push(name);
@@ -394,6 +437,9 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !create_parent {
+                    continue;
+                }
                 match fs::create_dir(&current) {
                     Ok(()) => fs::symlink_metadata(&current)?,
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -413,11 +459,11 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
         }
 
         let canonical_current = current.canonicalize()?;
-        if !canonical_current.starts_with(&canonical_root) {
+        if !canonical_current.starts_with(root) {
             return Err(ArkError::InvalidPackage(format!(
                 "Install destination '{}' resolves outside target root '{}'",
                 canonical_current.display(),
-                canonical_root.display()
+                root.display()
             )));
         }
         if !canonical_current.is_dir() {
@@ -426,9 +472,33 @@ fn create_destination_parent(root: &Path, parent: &Path) -> Result<()> {
                 current.display()
             )));
         }
+        current = canonical_current;
     }
 
-    Ok(())
+    let name = relative
+        .file_name()
+        .ok_or_else(|| ArkError::InvalidPackage("Install path has no file name".into()))?;
+    Ok(current.join(name))
+}
+
+/// Returns whether overwriting this destination requires consent and preservation.
+fn check_file_conflict(
+    destination: &Path,
+    installed_path: &Path,
+    ownership: &HashMap<PathBuf, String>,
+    package: &str,
+) -> Result<bool> {
+    if let Some(owner) = ownership.get(destination) {
+        if owner != package {
+            return Err(ArkError::PackageConflict(format!(
+                "File '{}' is already owned by package '{}'",
+                installed_path.display(),
+                owner
+            )));
+        }
+        return Ok(false);
+    }
+    Ok(path_exists(destination)?)
 }
 
 fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>> {

@@ -372,3 +372,291 @@ fn remover_warns_before_breaking_installed_dependents() {
     assert_eq!(db.is_installed("basepkg").unwrap(), None);
     assert!(db.is_installed("dependent").unwrap().is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_checks_ownership_through_directory_aliases() {
+    use std::os::unix::fs::symlink;
+
+    // Include ownership records written by older installers through an alias.
+    for (payload_path, owned_path) in [("bin/tool", "/usr/bin/tool"), ("usr/bin/tool", "/bin/tool")]
+    {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: aliasattack\nDescription: alias ownership test\nVersion: 1.0.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload = source.path().join("package").join(payload_path);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(payload, b"attacker content").unwrap();
+        let archive = output.path().join("aliasattack.ark");
+        create_ark(source.path(), &archive).unwrap();
+
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::write(root.path().join("usr/bin/tool"), b"owned content").unwrap();
+        symlink("usr/bin", root.path().join("bin")).unwrap();
+        let db = Database::new(root.path());
+        db.add_file_ownership(&[PathBuf::from(owned_path)], "owner")
+            .unwrap();
+        let owners = db.read_file_ownership().unwrap();
+        let logger = Logger::new(root.path());
+        let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+        assert!(matches!(
+            installer.install(&archive),
+            Err(ArkError::PackageConflict(_))
+        ));
+        assert_eq!(
+            fs::read(root.path().join("usr/bin/tool")).unwrap(),
+            b"owned content"
+        );
+        assert_eq!(db.read_file_ownership().unwrap(), owners);
+        assert_eq!(db.is_installed("aliasattack").unwrap(), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn aliased_install_records_resolved_paths_and_restores_originals() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: aliasinstall\nDescription: alias lifecycle test\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.path().join("package/bin")).unwrap();
+    fs::write(source.path().join("package/bin/tool"), b"package content").unwrap();
+    symlink("tool", source.path().join("package/bin/link")).unwrap();
+    let archive = output.path().join("aliasinstall.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+    fs::write(root.path().join("usr/bin/tool"), b"original content").unwrap();
+    symlink("usr/bin", root.path().join("bin")).unwrap();
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    let info = db.read_arkinfo("aliasinstall").unwrap();
+    assert_eq!(
+        info.files,
+        vec![
+            PathBuf::from("/usr/bin/link"),
+            PathBuf::from("/usr/bin/tool")
+        ]
+    );
+    assert_eq!(info.preserved_files.len(), 1);
+    assert_eq!(info.preserved_files[0].0, PathBuf::from("/usr/bin/tool"));
+    assert_eq!(
+        db.get_file_owner("/usr/bin/tool").unwrap().as_deref(),
+        Some("aliasinstall")
+    );
+    assert_eq!(
+        fs::read_link(root.path().join("usr/bin/link")).unwrap(),
+        PathBuf::from("tool")
+    );
+
+    // Later changes to the alias must not redirect verification or removal.
+    fs::remove_file(root.path().join("bin")).unwrap();
+    symlink("elsewhere", root.path().join("bin")).unwrap();
+    assert!(Verifier::new(&db).verify("aliasinstall").is_ok());
+    Remover::new(&db, &logger, PromptHandler::new(true, false, false))
+        .remove("aliasinstall")
+        .unwrap();
+    assert_eq!(
+        fs::read(root.path().join("usr/bin/tool")).unwrap(),
+        b"original content"
+    );
+    assert!(fs::symlink_metadata(root.path().join("usr/bin/link")).is_err());
+    assert!(db.read_file_ownership().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_package_aliases_that_redirect_later_writes() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: redirect\nDescription: package alias redirection test\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.path().join("package/b-path")).unwrap();
+    symlink("protected", source.path().join("package/a-link")).unwrap();
+    fs::write(
+        source.path().join("package/b-path/tool"),
+        b"attacker content",
+    )
+    .unwrap();
+    let archive = output.path().join("redirect.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    fs::create_dir(root.path().join("original")).unwrap();
+    fs::create_dir(root.path().join("protected")).unwrap();
+    fs::write(root.path().join("protected/tool"), b"owned content").unwrap();
+    symlink("original", root.path().join("a-link")).unwrap();
+    symlink("a-link", root.path().join("b-path")).unwrap();
+    let db = Database::new(root.path());
+    db.add_file_ownership(&[PathBuf::from("/protected/tool")], "owner")
+        .unwrap();
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+
+    assert!(matches!(
+        installer.install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert_eq!(
+        fs::read(root.path().join("protected/tool")).unwrap(),
+        b"owned content"
+    );
+    assert_eq!(
+        fs::read_link(root.path().join("a-link")).unwrap(),
+        PathBuf::from("original")
+    );
+    assert!(!root.path().join("original/tool").exists());
+    assert_eq!(db.is_installed("redirect").unwrap(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_duplicate_destinations_through_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: duplicatealias\nDescription: duplicate alias test\nVersion: 1.0.0\nArch: any\n",
+    )
+    .unwrap();
+    for path in ["package/bin/tool", "package/usr/bin/tool"] {
+        let payload = source.path().join(path);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(payload, b"package content").unwrap();
+    }
+    let archive = output.path().join("duplicatealias.ark");
+    create_ark(source.path(), &archive).unwrap();
+    fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+    fs::write(root.path().join("usr/bin/tool"), b"original content").unwrap();
+    symlink("usr/bin", root.path().join("bin")).unwrap();
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+
+    assert!(matches!(
+        installer.install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert_eq!(
+        fs::read(root.path().join("usr/bin/tool")).unwrap(),
+        b"original content"
+    );
+    assert_eq!(db.is_installed("duplicatealias").unwrap(), None);
+}
+
+#[test]
+fn installer_rechecks_consent_and_preserves_files_created_after_preflight() {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    for approve_new_file in [false, true] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: lateconflict\nDescription: late overwrite test\nVersion: 1.0.0\nArch: any\n",
+        )
+        .unwrap();
+        fs::create_dir_all(source.path().join("package/usr/bin")).unwrap();
+        for name in ["a-first", "z-last"] {
+            fs::write(
+                source.path().join("package/usr/bin").join(name),
+                b"package content",
+            )
+            .unwrap();
+        }
+        let archive = output.path().join("lateconflict.ark");
+        create_ark(source.path(), &archive).unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::write(root.path().join("usr/bin/a-first"), b"first original").unwrap();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+            .arg("--root")
+            .arg(root.path())
+            .arg("install")
+            .arg(&archive)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut seen = Vec::new();
+        let mut byte = [0];
+        while !seen.ends_with(b"Selection [Y/N/A/S]: ") {
+            assert_eq!(
+                stdout.read(&mut byte).unwrap(),
+                1,
+                "installer exited before prompting"
+            );
+            seen.push(byte[0]);
+        }
+        fs::write(root.path().join("usr/bin/z-last"), b"late original").unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(if approve_new_file {
+                b"Y\nY\n"
+            } else {
+                b"Y\nN\n"
+            })
+            .unwrap();
+        drop(stdin);
+        child.stdout = Some(stdout);
+        let result = child.wait_with_output().unwrap();
+        let db = Database::new(root.path());
+        if approve_new_file {
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                db.read_arkinfo("lateconflict")
+                    .unwrap()
+                    .preserved_files
+                    .len(),
+                2
+            );
+            let logger = Logger::new(root.path());
+            Remover::new(&db, &logger, PromptHandler::new(true, false, false))
+                .remove("lateconflict")
+                .unwrap();
+        } else {
+            assert_eq!(result.status.code(), Some(10));
+            assert_eq!(db.is_installed("lateconflict").unwrap(), None);
+            assert!(db.read_file_ownership().unwrap().is_empty());
+        }
+        assert_eq!(
+            fs::read(root.path().join("usr/bin/a-first")).unwrap(),
+            b"first original"
+        );
+        assert_eq!(
+            fs::read(root.path().join("usr/bin/z-last")).unwrap(),
+            b"late original"
+        );
+    }
+}
