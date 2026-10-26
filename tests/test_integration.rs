@@ -372,3 +372,122 @@ fn remover_warns_before_breaking_installed_dependents() {
     assert_eq!(db.is_installed("basepkg").unwrap(), None);
     assert!(db.is_installed("dependent").unwrap().is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn verifier_rejects_file_symlink_substitutions() {
+    use arkpkg::checksum::compute_sha256_path;
+    use arkpkg::verifier::VerifyStatus;
+    use std::os::unix::fs::symlink;
+
+    for originally_symlink in [false, true] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: typecheck\nDescription: object type integrity\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload = source.path().join("package/usr/bin/tool");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        if originally_symlink {
+            symlink("target", &payload).unwrap();
+        } else {
+            fs::write(&payload, b"target").unwrap();
+        }
+        let archive = output.path().join("typecheck.ark");
+        create_ark(source.path(), &archive).unwrap();
+        let db = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        logger.init().unwrap();
+        Installer::new(&db, &logger, PromptHandler::new(true, false, false))
+            .install(&archive)
+            .unwrap();
+        let installed = root.path().join("usr/bin/tool");
+        fs::write(
+            root.path().join("usr/bin/target"),
+            b"different reader content",
+        )
+        .unwrap();
+        let verifier = Verifier::new(&db);
+        assert!(matches!(
+            verifier.verify("typecheck").unwrap().as_slice(),
+            [VerifyStatus::Ok(_)]
+        ));
+        // Digest hex remains case-insensitive in typed records as in legacy records.
+        let mut info = db.read_arkinfo("typecheck").unwrap();
+        for (_, hash) in &mut info.file_hashes {
+            let (tag, digest) = hash.split_once('=').unwrap();
+            *hash = format!("{tag}={}", digest.to_ascii_uppercase());
+        }
+        db.write_arkinfo(&info).unwrap();
+        assert!(matches!(
+            verifier.verify("typecheck").unwrap().as_slice(),
+            [VerifyStatus::Ok(_)]
+        ));
+        let original_hash = compute_sha256_path(&installed).unwrap();
+        let original_content = fs::read(&installed).unwrap();
+        fs::remove_file(&installed).unwrap();
+        if originally_symlink {
+            fs::write(&installed, b"target").unwrap();
+        } else {
+            symlink("target", &installed).unwrap();
+        }
+        assert_eq!(compute_sha256_path(&installed).unwrap(), original_hash);
+        assert_ne!(fs::read(&installed).unwrap(), original_content);
+        assert!(
+            matches!(
+                verifier.verify("typecheck"),
+                Err(ArkError::VerificationFailed(_))
+            ),
+            "accepted substitution (originally_symlink={originally_symlink})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn verifier_does_not_certify_legacy_object_types() {
+    use arkpkg::checksum::compute_sha256_bytes;
+    use arkpkg::database::ArkInfo;
+    use arkpkg::verifier::VerifyStatus;
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let db = Database::new(root.path());
+    let installed = root.path().join("tool");
+    let base = "Name: legacy\nVersion: 1.0\nFiles:\n/tool\n";
+    for hashes in [
+        String::new(),
+        format!("FileHashes:\n/tool:{}\n", compute_sha256_bytes(b"target")),
+    ] {
+        db.write_arkinfo(&ArkInfo::parse(&format!("{base}{hashes}")).unwrap())
+            .unwrap();
+        fs::write(&installed, b"target").unwrap();
+        let verifier = Verifier::new(&db);
+        assert!(matches!(
+            verifier.verify("legacy").unwrap().as_slice(),
+            [VerifyStatus::Unverified(_)]
+        ));
+        fs::remove_file(&installed).unwrap();
+        symlink("target", &installed).unwrap();
+        assert!(matches!(
+            verifier.verify("legacy").unwrap().as_slice(),
+            [VerifyStatus::Unverified(_)]
+        ));
+        fs::remove_file(&installed).unwrap();
+        if !hashes.is_empty() {
+            fs::write(&installed, b"changed").unwrap();
+            assert!(matches!(
+                verifier.verify("legacy"),
+                Err(ArkError::VerificationFailed(_))
+            ));
+            fs::remove_file(&installed).unwrap();
+        }
+        assert!(matches!(
+            verifier.verify("legacy"),
+            Err(ArkError::VerificationFailed(_))
+        ));
+    }
+}

@@ -6,7 +6,7 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
-use crate::checksum::{compute_sha256_file, compute_sha256_path};
+use crate::checksum::{compute_integrity_path, compute_sha256_file};
 use crate::database::{ArkInfo, Database};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
@@ -274,7 +274,7 @@ impl<'a> Installer<'a> {
                 return Err(error);
             }
             let installed_path = PathBuf::from("/").join(rel_path);
-            let file_hash = match compute_sha256_path(&dest_path) {
+            let file_hash = match compute_integrity_path(&dest_path) {
                 Ok(hash) => hash,
                 Err(error) => {
                     self.rollback(&file_changes);
