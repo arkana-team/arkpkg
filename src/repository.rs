@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::checksum::compute_sha256_file;
 use crate::errors::{ArkError, Result};
-use crate::metadata::{Metadata, validate_package_name};
+use crate::metadata::{Metadata, read_metadata, validate_package_name};
 use crate::version::{DependencyReq, Version};
 
 const MAX_INDEX_SIZE: u64 = 16 * 1024 * 1024;
@@ -482,16 +482,15 @@ fn read_archive_metadata(path: &Path) -> Result<Metadata> {
         .entries()
         .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
     for entry in entries {
-        let mut entry = entry.map_err(|error| {
+        let entry = entry.map_err(|error| {
             ArkError::InvalidPackage(format!("Invalid package archive: {error}"))
         })?;
         let entry_path = entry
             .path()
             .map_err(|error| ArkError::InvalidPackage(format!("Invalid archive path: {error}")))?;
         if entry_path == Path::new("ARKPKG") && entry.header().entry_type().is_file() {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            return Metadata::parse(&content);
+            let size = entry.size();
+            return read_metadata(entry, size);
         }
     }
     Err(ArkError::InvalidPackage(
@@ -513,6 +512,38 @@ mod tests {
             file: file.into(),
             download_url: None,
             sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn repository_inspection_enforces_metadata_size_limit() {
+        let directory = TempDir::new().unwrap();
+        let archive_path = directory.path().join("metadata.ark");
+        for size in [1024 * 1024, 1024 * 1024 + 1] {
+            let mut metadata =
+                b"Name: bounded\nDescription: test\nVersion: 1.0\nArch: any\n#".to_vec();
+            metadata.resize(size, b'x');
+            let mut archive = tar::Builder::new(lz4_flex::frame::FrameEncoder::new(
+                File::create(&archive_path).unwrap(),
+            ));
+            let mut header = tar::Header::new_gnu();
+            header.set_path("ARKPKG").unwrap();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(metadata.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append(&header, metadata.as_slice()).unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+            assert!(fs::metadata(&archive_path).unwrap().len() < 16 * 1024);
+
+            let result = read_archive_metadata(&archive_path);
+            if size == 1024 * 1024 {
+                assert_eq!(result.unwrap().name, "bounded");
+            } else {
+                assert!(
+                    matches!(result, Err(ArkError::InvalidPackage(message)) if message.contains("size limit"))
+                );
+            }
         }
     }
 

@@ -1,8 +1,32 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::io::Read;
 
 use crate::errors::{ArkError, Result};
 use crate::version::{DependencyReq, Version};
+
+/// Maximum uncompressed size of an archive's `ARKPKG` metadata (1 MiB).
+pub(crate) const MAX_METADATA_SIZE: u64 = 1024 * 1024;
+
+pub(crate) fn check_metadata_size(size: u64) -> Result<()> {
+    if size > MAX_METADATA_SIZE {
+        return Err(ArkError::InvalidPackage(format!(
+            "ARKPKG metadata exceeds the {MAX_METADATA_SIZE} byte size limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks the declared size and bounds the read independently before parsing.
+pub(crate) fn read_metadata(reader: impl Read, declared_size: u64) -> Result<Metadata> {
+    check_metadata_size(declared_size)?;
+    let mut content = String::new();
+    reader
+        .take(MAX_METADATA_SIZE + 1)
+        .read_to_string(&mut content)?;
+    check_metadata_size(content.len() as u64)?;
+    Metadata::parse(&content)
+}
 
 /// Represents a provided feature or alias, e.g., `bash=/usr/bin/bash`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +333,38 @@ impl Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_reader_rejects_oversized_declarations_without_reading() {
+        let mut reader = std::io::Cursor::new(b"unread");
+        assert!(matches!(
+            read_metadata(&mut reader, u64::MAX),
+            Err(ArkError::InvalidPackage(message)) if message.contains("size limit")
+        ));
+        assert_eq!(reader.position(), 0);
+    }
+
+    #[test]
+    fn metadata_reader_bounds_reads_even_when_declared_size_is_small() {
+        let mut reader = std::io::repeat(b'x').take(MAX_METADATA_SIZE * 2);
+        assert!(matches!(
+            read_metadata(&mut reader, 0),
+            Err(ArkError::InvalidPackage(message)) if message.contains("size limit")
+        ));
+        assert_eq!(reader.limit(), MAX_METADATA_SIZE - 1);
+    }
+
+    #[test]
+    fn metadata_reader_preserves_utf8_and_parse_errors() {
+        assert!(matches!(
+            read_metadata(&b"\xff"[..], 1),
+            Err(ArkError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(matches!(
+            read_metadata(&b"Name: incomplete\n"[..], 17),
+            Err(ArkError::InvalidPackage(message)) if message == "Missing field: Description"
+        ));
+    }
 
     #[test]
     fn test_parse_valid_metadata() {
