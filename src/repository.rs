@@ -447,6 +447,7 @@ fn validate_download_url(value: &str) -> Result<String> {
 
 fn request(url: &str, limit: u64) -> Result<ureq::Response> {
     let agent = ureq::AgentBuilder::new()
+        .https_only(true)
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
         .build();
@@ -563,6 +564,15 @@ mod tests {
         );
         assert!(validate_repository_url("http://example.com").is_err());
         assert!(validate_repository_url("https://user:pass@example.com").is_err());
+    }
+
+    #[test]
+    fn requests_reject_http_before_connecting() {
+        let error = request("http://127.0.0.1:0/index.json", MAX_INDEX_SIZE).unwrap_err();
+        assert!(
+            error.to_string().contains("https_only"),
+            "expected HTTPS enforcement before connecting, got: {error}"
+        );
     }
 
     #[test]
