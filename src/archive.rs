@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder};
 
 use crate::errors::{ArkError, Result};
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, check_metadata_size, read_metadata};
 
 // Fixed per-package limits apply to local installation and repository resolution.
 const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -146,6 +146,9 @@ fn extract_ark_with_limits(
                 "Archive metadata entry must be a regular file".into(),
             ));
         }
+        if path == Path::new("ARKPKG") {
+            check_metadata_size(entry.size())?;
+        }
         if path == Path::new("package") && !entry_type.is_dir() {
             return Err(ArkError::InvalidPackage(
                 "Archive package root must be a directory".into(),
@@ -193,8 +196,9 @@ fn extract_ark_with_limits(
         ));
     }
 
-    let meta_content = fs::read_to_string(metadata_path)?;
-    Metadata::parse(&meta_content)
+    let metadata_file = File::open(metadata_path)?;
+    let metadata_size = metadata_file.metadata()?.len();
+    read_metadata(metadata_file, metadata_size)
 }
 
 fn safe_archive_symlink_target(link_path: &Path, target: &Path) -> bool {
@@ -434,6 +438,36 @@ mod tests {
         header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
         header.set_cksum();
         archive.append(&header, content).unwrap();
+    }
+
+    #[test]
+    fn extraction_enforces_metadata_size_limit() {
+        let archive_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("metadata.ark");
+        for size in [1024 * 1024, 1024 * 1024 + 1] {
+            let extraction_dir = TempDir::new().unwrap();
+            let mut metadata =
+                b"Name: bounded\nDescription: test\nVersion: 1.0\nArch: any\n#".to_vec();
+            metadata.resize(size, b'x');
+            let mut archive = Builder::new(FrameEncoder::new(File::create(&archive_path).unwrap()));
+            append_entry(&mut archive, "ARKPKG", tar::EntryType::Regular, &metadata);
+            append_entry(&mut archive, "package", tar::EntryType::Directory, b"");
+            archive.into_inner().unwrap().finish().unwrap();
+
+            let result = extract_ark(&archive_path, extraction_dir.path());
+            if size == 1024 * 1024 {
+                assert_eq!(result.unwrap().name, "bounded");
+                assert_eq!(
+                    fs::read(extraction_dir.path().join("ARKPKG")).unwrap(),
+                    metadata
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ArkError::InvalidPackage(message)) if message.contains("size limit"))
+                );
+                assert!(!extraction_dir.path().join("ARKPKG").exists());
+            }
+        }
     }
 
     #[test]
