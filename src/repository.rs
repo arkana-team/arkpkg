@@ -1,6 +1,10 @@
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use cap_tempfile::TempFile;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use lz4_flex::frame::FrameDecoder;
@@ -19,6 +23,7 @@ const MAX_PACKAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 // Repository metadata must finish within this decoded tar search budget.
 // The package builder writes ARKPKG before the payload.
 const MAX_METADATA_SCAN_SIZE: u64 = 16 * 1024 * 1024;
+const REPOSITORIES_DIR: &str = "etc/arkpkg/repos.d";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryConfig {
@@ -50,6 +55,7 @@ pub struct RepositoryPackage {
 #[derive(Debug, Clone)]
 pub struct RepositoryManager {
     root: PathBuf,
+    root_dir: Arc<OnceLock<Dir>>,
 }
 
 /// A validated snapshot of the configured repository indexes.
@@ -63,69 +69,102 @@ impl RepositoryManager {
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            root_dir: Arc::new(OnceLock::new()),
         }
     }
 
-    fn repositories_dir(&self) -> PathBuf {
-        self.root.join("etc/arkpkg/repos.d")
+    fn repositories_dir(&self, create: bool) -> std::io::Result<Dir> {
+        // Only the user-selected root is opened with ambient authority. Retain
+        // its handle across calls and clones so pathname replacement cannot redirect IO.
+        if self.root_dir.get().is_none() {
+            if create {
+                fs::create_dir_all(&self.root)?;
+            }
+            let dir = Dir::open_ambient_dir(&self.root, ambient_authority())?;
+            let _ = self.root_dir.set(dir);
+        }
+        let root = self.root_dir.get().expect("root directory initialized");
+        if create {
+            root.create_dir_all(REPOSITORIES_DIR)?;
+        }
+        root.open_dir(REPOSITORIES_DIR)
     }
 
-    fn config_path(&self, name: &str) -> Result<PathBuf> {
+    fn config_name(name: &str) -> Result<String> {
         validate_package_name(name)?;
-        Ok(self.repositories_dir().join(format!("{name}.json")))
+        Ok(format!("{name}.json"))
     }
 
     pub fn add(&self, name: &str, url: &str) -> Result<()> {
-        let path = self.config_path(name)?;
+        let filename = Self::config_name(name)?;
         let config = RepositoryConfig {
             name: name.to_string(),
             url: validate_repository_url(url)?,
         };
-        fs::create_dir_all(self.repositories_dir())?;
-        if path.exists() {
-            return Err(ArkError::Generic(format!(
-                "Repository '{}' already exists",
-                name
-            )));
+        let directory = self.repositories_dir(true)?;
+        match directory.symlink_metadata(&filename) {
+            Ok(_) => {
+                return Err(ArkError::Generic(format!(
+                    "Repository '{}' already exists",
+                    name
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
-        let mut temporary = NamedTempFile::new_in(self.repositories_dir())?;
+        let mut temporary = TempFile::new(&directory)?;
+        // Preserve NamedTempFile's private permissions before writing data.
+        #[cfg(unix)]
+        {
+            use cap_std::fs::PermissionsExt;
+            temporary
+                .as_file()
+                .set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+        }
         serde_json::to_writer_pretty(&mut temporary, &config).map_err(|error| {
             ArkError::Generic(format!("Could not encode repository config: {error}"))
         })?;
         temporary.write_all(b"\n")?;
-        temporary
-            .persist(path)
-            .map_err(|error| ArkError::Io(error.error))?;
+        publish_new_config(temporary, &directory, &filename).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ArkError::Generic(format!("Repository '{}' already exists", name))
+            } else {
+                error.into()
+            }
+        })?;
         Ok(())
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
-        let path = self.config_path(name)?;
-        if !path.exists() {
-            return Err(ArkError::PackageNotFound(format!(
-                "Repository '{}' is not configured",
-                name
-            )));
+        let filename = Self::config_name(name)?;
+        match self
+            .repositories_dir(false)
+            .and_then(|directory| directory.remove_file(filename))
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+                ArkError::PackageNotFound(format!("Repository '{}' is not configured", name)),
+            ),
+            Err(error) => Err(error.into()),
         }
-        fs::remove_file(path)?;
-        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<RepositoryConfig>> {
-        let directory = self.repositories_dir();
-        if !directory.exists() {
-            return Ok(Vec::new());
-        }
+        let directory = match self.repositories_dir(false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
 
         let mut configs = Vec::new();
-        for entry in fs::read_dir(directory)? {
-            let path = entry?.path();
+        for entry in directory.entries()? {
+            let path = PathBuf::from(entry?.file_name());
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let config: RepositoryConfig =
-                serde_json::from_slice(&fs::read(&path)?).map_err(|error| {
+            let config: RepositoryConfig = serde_json::from_slice(&directory.read(&path)?)
+                .map_err(|error| {
                     ArkError::InvalidPackage(format!(
                         "Invalid repository config '{}': {error}",
                         path.display()
@@ -352,6 +391,49 @@ impl RepositoryManager {
         }
         Ok(index.packages)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_new_config(
+    temporary: TempFile<'_>,
+    directory: &Dir,
+    filename: &str,
+) -> std::io::Result<()> {
+    use rustix::fs::AtFlags;
+
+    // Linking the open file descriptor publishes the completed config in one
+    // operation and fails if another add has already created this name.
+    let proc_self_fd = rustix_linux_procfs::proc_self_fd().map_err(std::io::Error::from)?;
+    let descriptor = rustix::path::DecInt::from_fd(temporary.as_file());
+    rustix::fs::linkat(
+        proc_self_fd,
+        descriptor.as_c_str(),
+        directory,
+        filename,
+        AtFlags::SYMLINK_FOLLOW,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn publish_new_config(
+    mut temporary: TempFile<'_>,
+    directory: &Dir,
+    filename: &str,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut destination = directory.open_with(filename, &options)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        destination.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.rewind()?;
+    std::io::copy(&mut temporary, &mut destination)?;
+    Ok(())
 }
 
 fn rooted_download_tempfile(root: &Path) -> Result<NamedTempFile> {
@@ -825,6 +907,232 @@ mod tests {
         );
         repositories.remove("main").unwrap();
         assert!(repositories.list().unwrap().is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn repository_config_publication_does_not_replace_existing_file() {
+        let root = TempDir::new().unwrap();
+        let existing_contents = br#"{"name":"main","url":"https://old.example"}"#;
+        fs::write(root.path().join("main.json"), existing_contents).unwrap();
+        let directory = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let mut temporary = TempFile::new(&directory).unwrap();
+        temporary.write_all(b"replacement config").unwrap();
+
+        let error = publish_new_config(temporary, &directory, "main.json").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(root.path().join("main.json")).unwrap(),
+            existing_contents
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_reject_escaping_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for component in ["etc", "etc/arkpkg", "etc/arkpkg/repos.d"] {
+            for relative in [false, true] {
+                let parent = TempDir::new().unwrap();
+                let root = parent.path().join("root");
+                let outside = parent.path().join("outside");
+                let link = root.join(component);
+                fs::create_dir_all(link.parent().unwrap()).unwrap();
+                fs::create_dir(&outside).unwrap();
+                let target = if relative {
+                    PathBuf::from("../".repeat(Path::new(component).components().count()))
+                        .join("outside")
+                } else {
+                    outside.clone()
+                };
+                symlink(target, &link).unwrap();
+                let configs = outside.join(
+                    Path::new("etc/arkpkg/repos.d")
+                        .strip_prefix(component)
+                        .unwrap(),
+                );
+                fs::create_dir_all(&configs).unwrap();
+                let existing = configs.join("existing.json");
+                let contents = br#"{"name":"existing","url":"https://example.com"}"#;
+                fs::write(&existing, contents).unwrap();
+                let repositories = RepositoryManager::new(&root);
+
+                assert!(repositories.list().is_err(), "listed through {component}");
+                assert!(repositories.add("new", "https://example.com").is_err());
+                assert!(repositories.remove("existing").is_err());
+                assert_eq!(fs::read(&existing).unwrap(), contents);
+                assert_eq!(fs::read_dir(&configs).unwrap().count(), 1);
+
+                fs::remove_dir_all(&outside).unwrap();
+                assert!(repositories.add("new", "https://example.com").is_err());
+                assert!(!outside.exists(), "created dangling target for {component}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_reject_installed_absolute_directory_symlink() {
+        use crate::archive::create_ark;
+        use crate::database::Database;
+        use crate::installer::Installer;
+        use crate::logger::Logger;
+        use crate::prompt::PromptHandler;
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: repolink\nDescription: repository symlink\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let config_parent = source.path().join("package/etc/arkpkg");
+        fs::create_dir_all(&config_parent).unwrap();
+        symlink(outside.path(), config_parent.join("repos.d")).unwrap();
+        let archive = source.path().join("repolink.ark");
+        create_ark(source.path(), &archive).unwrap();
+        let database = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        logger.init().unwrap();
+        let mut installer =
+            Installer::new(&database, &logger, PromptHandler::new(true, false, false));
+        installer.install(&archive).unwrap();
+        let existing = outside.path().join("existing.json");
+        let contents = br#"{"name":"existing","url":"https://example.com"}"#;
+        fs::write(&existing, contents).unwrap();
+        let repositories = RepositoryManager::new(root.path());
+
+        assert!(repositories.add("new", "https://example.com").is_err());
+        assert!(repositories.list().is_err());
+        assert!(repositories.remove("existing").is_err());
+        assert_eq!(fs::read(existing).unwrap(), contents);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_reject_escaping_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for dangling in [false, true] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let directory = root.path().join(REPOSITORIES_DIR);
+            fs::create_dir_all(&directory).unwrap();
+            let target = outside.path().join("config.json");
+            let contents = br#"{"name":"main","url":"https://example.com"}"#;
+            if !dangling {
+                fs::write(&target, contents).unwrap();
+            }
+            let link = directory.join("main.json");
+            symlink(&target, &link).unwrap();
+            let repositories = RepositoryManager::new(root.path());
+
+            assert!(repositories.list().is_err());
+            assert!(repositories.add("main", "https://example.org").is_err());
+            assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+            repositories.remove("main").unwrap();
+            assert!(fs::symlink_metadata(link).is_err());
+            if dangling {
+                assert!(!target.exists());
+            } else {
+                assert_eq!(fs::read(target).unwrap(), contents);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_remain_anchored_after_root_replacement() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("root");
+        let moved = parent.path().join("moved");
+        let outside = TempDir::new().unwrap();
+        let repositories = RepositoryManager::new(&root);
+        assert!(repositories.list().unwrap().is_empty());
+        assert!(matches!(
+            repositories.remove("main"),
+            Err(ArkError::PackageNotFound(_))
+        ));
+        repositories.add("main", "https://example.com").unwrap();
+        fs::rename(&root, &moved).unwrap();
+        symlink(outside.path(), &root).unwrap();
+
+        let cloned = repositories.clone();
+        cloned.add("other", "https://example.org").unwrap();
+        assert_eq!(cloned.list().unwrap().len(), 2);
+        assert_eq!(
+            fs::metadata(moved.join(REPOSITORIES_DIR).join("other.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        cloned.remove("main").unwrap();
+        assert!(!moved.join(REPOSITORIES_DIR).join("main.json").exists());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_reject_replaced_directory_ancestry() {
+        use std::os::unix::fs::symlink;
+
+        for component in ["etc", "etc/arkpkg", "etc/arkpkg/repos.d"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let repositories = RepositoryManager::new(root.path());
+            repositories.add("main", "https://example.com").unwrap();
+            let external = RepositoryManager::new(outside.path());
+            external.add("main", "https://example.org").unwrap();
+            let path = outside.path().join(REPOSITORIES_DIR).join("main.json");
+            let before = fs::read(&path).unwrap();
+            fs::remove_dir_all(root.path().join(component)).unwrap();
+            symlink(outside.path().join(component), root.path().join(component)).unwrap();
+
+            assert!(repositories.list().is_err());
+            assert!(repositories.add("new", "https://example.com").is_err());
+            assert!(repositories.remove("main").is_err());
+            assert_eq!(fs::read(path).unwrap(), before);
+            assert_eq!(external.list().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configs_support_contained_relative_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for component in ["etc", "etc/arkpkg", "etc/arkpkg/repos.d"] {
+            let root = TempDir::new().unwrap();
+            let link = root.path().join(component);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            fs::create_dir(root.path().join("storage")).unwrap();
+            let target = PathBuf::from("../".repeat(Path::new(component).components().count() - 1))
+                .join("storage");
+            symlink(target, &link).unwrap();
+            let repositories = RepositoryManager::new(root.path());
+
+            repositories.add("main", "https://example.com/").unwrap();
+            assert_eq!(repositories.list().unwrap()[0].url, "https://example.com");
+            assert!(repositories.add("main", "https://example.org").is_err());
+            assert!(
+                repositories
+                    .add("../escape", "https://example.com")
+                    .is_err()
+            );
+            assert!(repositories.remove("../escape").is_err());
+            repositories.remove("main").unwrap();
+            assert!(repositories.list().unwrap().is_empty());
+        }
     }
 
     #[test]

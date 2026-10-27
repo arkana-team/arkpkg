@@ -78,6 +78,7 @@ dependencies = [
  "log",
  "lz4_flex",
  "rustix",
+ "rustix-linux-procfs",
  "serde",
  "serde_json",
  "sha2",
