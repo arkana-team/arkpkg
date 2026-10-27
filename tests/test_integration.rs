@@ -173,6 +173,120 @@ fn verifier_detects_modified_installed_files() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn installer_rejects_trimmed_paths_before_copying_any_payload() {
+    use std::os::unix::fs::symlink;
+
+    for suffix in [" ", "\u{00a0}", "\u{2003}"] {
+        for link_payload in [false, true] {
+            let source = TempDir::new().unwrap();
+            let root = TempDir::new().unwrap();
+            let output = TempDir::new().unwrap();
+            fs::write(
+                source.path().join("ARKPKG"),
+                "Name: pathattack\nDescription: pathname identity test\nVersion: 1.0\nArch: any\n",
+            )
+            .unwrap();
+            let first = source.path().join("package/aaa-new/first");
+            fs::create_dir_all(first.parent().unwrap()).unwrap();
+            fs::write(first, b"must not be copied").unwrap();
+            let relative = format!("usr/bin/tool{suffix}");
+            let payload = source.path().join("package").join(&relative);
+            fs::create_dir_all(payload.parent().unwrap()).unwrap();
+            if link_payload {
+                symlink("tool", payload).unwrap();
+            } else {
+                fs::write(payload, b"attacker content").unwrap();
+            }
+            let archive = output.path().join("pathattack.ark");
+            create_ark(source.path(), &archive).unwrap();
+
+            let db = Database::new(root.path());
+            db.add_file_ownership(&[PathBuf::from("/usr/bin/tool")], "owner")
+                .unwrap();
+            let ownership = fs::read(root.path().join("etc/arkpkg/file.db")).unwrap();
+            fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+            fs::write(root.path().join("usr/bin/tool"), b"owned content").unwrap();
+            fs::write(root.path().join(&relative), b"untracked original").unwrap();
+            let logger = Logger::new(root.path());
+            let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+            assert!(matches!(
+                installer.install(&archive),
+                Err(ArkError::InvalidPackage(_))
+            ));
+            assert!(!root.path().join("aaa-new").exists());
+            assert_eq!(
+                fs::read(root.path().join("usr/bin/tool")).unwrap(),
+                b"owned content"
+            );
+            assert_eq!(
+                fs::read(root.path().join(&relative)).unwrap(),
+                b"untracked original"
+            );
+            assert_eq!(
+                fs::read(root.path().join("etc/arkpkg/file.db")).unwrap(),
+                ownership
+            );
+            assert_eq!(db.is_installed("pathattack").unwrap(), None);
+            assert!(
+                !root
+                    .path()
+                    .join("etc/arkpkg/packages/pathattack.arkinfo")
+                    .exists()
+            );
+            assert_eq!(
+                fs::read_dir(root.path().join("usr/bin")).unwrap().count(),
+                2
+            );
+        }
+    }
+}
+
+#[test]
+fn package_lifecycle_preserves_representable_pathnames() {
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: pathcheck\nDescription: pathname round trip\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    let relative = "usr/share/space dir/ tool :caf\u{00e9}";
+    let payload = source.path().join("package").join(relative);
+    let installed = root.path().join(relative);
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::write(payload, b"package content").unwrap();
+    fs::write(&installed, b"original content").unwrap();
+    let archive = output.path().join("pathcheck.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    Installer::new(&db, &logger, PromptHandler::new(true, false, false))
+        .install(&archive)
+        .unwrap();
+    let path = PathBuf::from("/").join(relative);
+    let info = db.read_arkinfo("pathcheck").unwrap();
+    assert_eq!(info.files, vec![path.clone()]);
+    assert_eq!(info.file_hashes[0].0, path);
+    assert_eq!(info.preserved_files[0].0, path);
+    assert_eq!(
+        db.get_file_owner(&path).unwrap().as_deref(),
+        Some("pathcheck")
+    );
+    Verifier::new(&db).verify("pathcheck").unwrap();
+    Remover::new(&db, &logger, PromptHandler::new(true, false, false))
+        .remove("pathcheck")
+        .unwrap();
+    assert_eq!(fs::read(installed).unwrap(), b"original content");
+    assert!(db.read_file_ownership().unwrap().is_empty());
+    assert_eq!(db.is_installed("pathcheck").unwrap(), None);
+}
+
 #[test]
 fn installer_rejects_packages_for_a_different_architecture() {
     let pkg_source_dir = TempDir::new().unwrap();

@@ -279,6 +279,8 @@ pub(crate) fn validate_installed_path(path: &Path) -> Result<()> {
         || value.contains('\0')
         || value.contains('=')
         || value.ends_with('/')
+        // The line-oriented database readers trim surrounding whitespace.
+        || value.trim() != value
         || value.bytes().any(|byte| byte.is_ascii_control())
         || value
             .split('/')
@@ -331,8 +333,9 @@ fn validate_preserved_files(
     Ok(())
 }
 
-/// Reject package payload files that overlap the package manager's own state.
+/// Reject payload paths that cannot be recorded losslessly or overlap database state.
 pub(crate) fn validate_payload_path(relative: &Path) -> Result<()> {
+    validate_installed_path(&Path::new("/").join(relative))?;
     for reserved in [
         "etc/arkpkg/package.db",
         "etc/arkpkg/file.db",
@@ -624,6 +627,8 @@ impl Database {
         for path in &arkinfo.files {
             validate_installed_path(path)?;
         }
+        validate_file_hashes(&arkinfo.files, &arkinfo.file_hashes)?;
+        validate_preserved_files(&arkinfo.files, &arkinfo.preserved_files)?;
         let target_name = Self::arkinfo_name(&arkinfo.name)?;
         let packages_dir = self.packages_dir()?;
         let mut temp_file = Self::temporary_file(&packages_dir)?;
@@ -965,6 +970,61 @@ mod tests {
                 .is_err()
         );
         assert_eq!(ownership, before);
+    }
+
+    #[test]
+    fn rejects_ownership_paths_that_would_be_trimmed() {
+        let root = TempDir::new().unwrap();
+        let db = Database::new(root.path());
+        db.add_file_ownership(&[PathBuf::from("/usr/bin/tool")], "owner")
+            .unwrap();
+        let mut ownership = db.read_file_ownership().unwrap();
+        let before = ownership.clone();
+        let contents = fs::read(root.path().join("etc/arkpkg/file.db")).unwrap();
+
+        for suffix in [" ", "\u{00a0}", "\u{2003}"] {
+            let path = PathBuf::from(format!("/usr/bin/tool{suffix}"));
+            assert!(
+                db.add_file_ownership_from_map(&mut ownership, &[path], "other")
+                    .is_err()
+            );
+            assert_eq!(ownership, before);
+            assert_eq!(
+                fs::read(root.path().join("etc/arkpkg/file.db")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unrepresentable_paths_in_all_arkinfo_records() {
+        let root = TempDir::new().unwrap();
+        let db = Database::new(root.path());
+        let mut info =
+            ArkInfo::parse("Name: sample\nVersion: 1.0\nFiles:\n/usr/bin/tool\n").unwrap();
+        info.file_hashes = vec![(PathBuf::from("/usr/bin/tool"), "a".repeat(64))];
+        info.preserved_files = vec![(
+            PathBuf::from("/usr/bin/tool"),
+            PathBuf::from("/usr/bin/.tmp-original"),
+        )];
+        db.write_arkinfo(&info).unwrap();
+        let metadata = root.path().join("etc/arkpkg/packages/sample.arkinfo");
+        let contents = fs::read(&metadata).unwrap();
+
+        for suffix in [" ", "\u{00a0}", "\u{2003}"] {
+            for field in 0..4 {
+                let mut invalid = info.clone();
+                let path = match field {
+                    0 => &mut invalid.files[0],
+                    1 => &mut invalid.file_hashes[0].0,
+                    2 => &mut invalid.preserved_files[0].0,
+                    _ => &mut invalid.preserved_files[0].1,
+                };
+                path.as_mut_os_string().push(suffix);
+                assert!(db.write_arkinfo(&invalid).is_err());
+                assert_eq!(fs::read(&metadata).unwrap(), contents);
+            }
+        }
     }
 
     #[test]
