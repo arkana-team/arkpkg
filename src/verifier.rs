@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::checksum::compute_sha256_path;
+use crate::checksum::{compute_integrity_path, compute_sha256_path, typed_file_digest};
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
 
@@ -22,7 +22,6 @@ impl<'a> Verifier<'a> {
     }
 
     /// Verifies all installed files of a package.
-    /// Fails if a managed file is missing, modified, or lacks an expected hash.
     pub fn verify(&self, pkg_name: &str) -> Result<Vec<VerifyStatus>> {
         let arkinfo = self.db.read_arkinfo(pkg_name).map_err(|_| {
             ArkError::PackageNotFound(format!("Package '{}' is not installed", pkg_name))
@@ -66,8 +65,19 @@ impl<'a> Verifier<'a> {
             match fs::symlink_metadata(&target_path) {
                 Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
                     if let Some(expected) = file_hashes.get(file_rel) {
-                        let actual = compute_sha256_path(&target_path)?;
-                        if actual.eq_ignore_ascii_case(expected) {
+                        let typed = typed_file_digest(expected).is_some();
+                        let actual = if typed {
+                            compute_integrity_path(&target_path)?
+                        } else {
+                            compute_sha256_path(&target_path)?
+                        };
+                        if !typed && actual.eq_ignore_ascii_case(expected) {
+                            println!(
+                                "UNVERIFIED {} (legacy metadata lacks object type)",
+                                file_rel.display()
+                            );
+                            results.push(VerifyStatus::Unverified(file_rel.clone()));
+                        } else if actual.eq_ignore_ascii_case(expected) {
                             println!("OK      {}", file_rel.display());
                             results.push(VerifyStatus::Ok(file_rel.clone()));
                         } else {

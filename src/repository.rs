@@ -16,6 +16,9 @@ use crate::version::{DependencyReq, Version};
 
 const MAX_INDEX_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PACKAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+// Repository metadata must finish within this decoded tar search budget.
+// The package builder writes ARKPKG before the payload.
+const MAX_METADATA_SCAN_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryConfig {
@@ -493,7 +496,11 @@ fn request(url: &str, limit: u64) -> Result<ureq::Response> {
 fn read_archive_metadata(path: &Path) -> Result<Metadata> {
     let file = File::open(path)?;
     let decoder = FrameDecoder::new(file);
-    let mut archive = tar::Archive::new(ArchiveReader::new(decoder, MAX_DECODED_ARCHIVE_BYTES));
+    // Limit below tar so skipped payloads and GNU/PAX extension records also
+    // count toward the decoded search budget, while retaining the archive-wide
+    // reader limit for the shared package parser.
+    let bounded = ArchiveReader::new(decoder, MAX_DECODED_ARCHIVE_BYTES);
+    let mut archive = tar::Archive::new(bounded.take(MAX_METADATA_SCAN_SIZE));
     let entries = archive
         .entries()
         .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
@@ -505,9 +512,15 @@ fn read_archive_metadata(path: &Path) -> Result<Metadata> {
             .path()
             .map_err(|error| ArkError::InvalidPackage(format!("Invalid archive path: {error}")))?;
         if entry_path == Path::new("ARKPKG") && entry.header().entry_type().is_file() {
+            // Entry::size includes PAX size overrides, unlike the raw header.
             let size = entry.size();
             return read_metadata(entry, size);
         }
+    }
+    if archive.into_inner().limit() == 0 {
+        return Err(ArkError::InvalidPackage(format!(
+            "ARKPKG metadata was not found within the {MAX_METADATA_SCAN_SIZE} byte decoded search limit"
+        )));
     }
     Err(ArkError::InvalidPackage(
         "Package archive is missing its ARKPKG metadata".into(),
@@ -517,7 +530,143 @@ fn read_archive_metadata(path: &Path) -> Result<Metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::MAX_METADATA_SIZE;
+    use lz4_flex::frame::FrameEncoder;
     use tempfile::TempDir;
+
+    const TEST_METADATA: &[u8] = b"Name: hello\nDescription: test\nVersion: 1.2.3\nArch: any\n";
+
+    fn metadata_archive(
+        build: impl FnOnce(&mut tar::Builder<FrameEncoder<&mut File>>),
+    ) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut archive = tar::Builder::new(FrameEncoder::new(file.as_file_mut()));
+        build(&mut archive);
+        archive.into_inner().unwrap().finish().unwrap();
+        file
+    }
+
+    fn append_test_entry<W: Write>(
+        archive: &mut tar::Builder<W>,
+        path: &str,
+        kind: tar::EntryType,
+        size: u64,
+        data: impl Read,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, data).unwrap();
+    }
+
+    #[test]
+    fn archive_metadata_enforces_decoded_size_limit() {
+        for size in [
+            TEST_METADATA.len() as u64,
+            MAX_METADATA_SIZE - 1,
+            MAX_METADATA_SIZE,
+            MAX_METADATA_SIZE + 1,
+        ] {
+            let file = metadata_archive(|archive| {
+                append_test_entry(
+                    archive,
+                    "ARKPKG",
+                    tar::EntryType::Regular,
+                    size,
+                    TEST_METADATA.chain(std::io::repeat(b' ')).take(size),
+                );
+            });
+            // Highly compressible metadata passes the compressed download limit.
+            assert!(file.as_file().metadata().unwrap().len() < MAX_METADATA_SIZE);
+            let result = read_archive_metadata(file.path());
+            if size <= MAX_METADATA_SIZE {
+                assert_eq!(result.unwrap().name, "hello");
+            } else {
+                assert!(
+                    matches!(result, Err(ArkError::InvalidPackage(message)) if message.contains("size limit"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_metadata_rejects_oversized_pax_size_before_reading_body() {
+        let file = metadata_archive(|archive| {
+            let size = (MAX_METADATA_SIZE + 1).to_string();
+            archive
+                .append_pax_extensions([("size", size.as_bytes())])
+                .unwrap();
+            // The small raw header size must not bypass the PAX override.
+            append_test_entry(
+                archive,
+                "ARKPKG",
+                tar::EntryType::Regular,
+                TEST_METADATA.len() as u64,
+                TEST_METADATA,
+            );
+        });
+        assert!(
+            matches!(read_archive_metadata(file.path()), Err(ArkError::InvalidPackage(message)) if message.contains("size limit"))
+        );
+    }
+
+    #[test]
+    fn archive_metadata_search_limit_includes_skipped_payload_and_metadata() {
+        // Two 512-byte headers plus 1024 bytes of metadata end exactly at the
+        // budget. Moving metadata later must reject even a parseable prefix.
+        for extra in [0, 512, 1024, 1536] {
+            let file = metadata_archive(|archive| {
+                let payload_size = MAX_METADATA_SCAN_SIZE - 2048 + extra;
+                append_test_entry(
+                    archive,
+                    "package/payload",
+                    tar::EntryType::Regular,
+                    payload_size,
+                    std::io::repeat(0).take(payload_size),
+                );
+                append_test_entry(
+                    archive,
+                    "ARKPKG",
+                    tar::EntryType::Regular,
+                    1024,
+                    TEST_METADATA.chain(std::io::repeat(b' ')).take(1024),
+                );
+            });
+            let result = read_archive_metadata(file.path());
+            if extra == 0 {
+                assert_eq!(result.unwrap().name, "hello");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "accepted metadata beyond the search budget: {extra}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archive_metadata_search_limit_includes_tar_extensions() {
+        let file = metadata_archive(|archive| {
+            append_test_entry(
+                archive,
+                "././@LongLink",
+                tar::EntryType::GNULongLink,
+                MAX_METADATA_SCAN_SIZE,
+                std::io::repeat(0).take(MAX_METADATA_SCAN_SIZE),
+            );
+            append_test_entry(
+                archive,
+                "ARKPKG",
+                tar::EntryType::Regular,
+                TEST_METADATA.len() as u64,
+                TEST_METADATA,
+            );
+        });
+        assert!(read_archive_metadata(file.path()).is_err());
+    }
 
     fn package(file: &str) -> RepositoryPackage {
         RepositoryPackage {

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use crate::checksum::typed_file_digest;
 use crate::errors::{ArkError, Result};
 use crate::metadata::{ProvideItem, validate_package_atom, validate_package_name};
 use crate::version::{DependencyReq, Version};
@@ -21,7 +22,9 @@ pub struct ArkInfo {
     pub installed_at: String,
     pub checksum: String,
     pub files: Vec<PathBuf>,
-    /// Per-file SHA-256 values, recorded as (installed path, digest).
+    /// Per-file integrity values, recorded as (installed path, tagged digest).
+    /// New records use `file-sha256=<hex>` or `symlink-sha256=<hex>`.
+    /// Legacy bare SHA-256 values remain readable but cannot verify object type.
     pub file_hashes: Vec<(PathBuf, String)>,
     pub dependencies: Vec<DependencyReq>,
     pub provides: Vec<ProvideItem>,
@@ -255,7 +258,8 @@ fn validate_file_hashes(files: &[PathBuf], file_hashes: &[(PathBuf, String)]) ->
                 path.display()
             )));
         }
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let digest = typed_file_digest(hash).unwrap_or(hash);
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ArkError::InvalidPackage(format!(
                 "Invalid SHA-256 digest for '{}'",
                 path.display()
@@ -265,7 +269,7 @@ fn validate_file_hashes(files: &[PathBuf], file_hashes: &[(PathBuf, String)]) ->
     Ok(())
 }
 
-fn validate_installed_path(path: &Path) -> Result<()> {
+pub(crate) fn validate_installed_path(path: &Path) -> Result<()> {
     let value = path.to_str().ok_or_else(|| {
         ArkError::InvalidPackage("Installed file paths must be valid UTF-8".into())
     })?;
@@ -969,6 +973,30 @@ mod tests {
             ArkInfo::parse("Name: sample\nVersion: 1.0.0\nFiles:\n/usr/bin/sample\n").unwrap();
         assert!(arkinfo.preserved_files.is_empty());
         assert!(arkinfo.file_hashes.is_empty());
+    }
+
+    #[test]
+    fn typed_file_hashes_round_trip_and_reject_malformed_records() {
+        // A colon in a path must not be mistaken for part of the integrity tag.
+        let path = "/usr/bin/sample:variant";
+        let record = |hash: &str| {
+            format!("Name: sample\nVersion: 1.0\nFiles:\n{path}\nFileHashes:\n{path}:{hash}\n")
+        };
+        for prefix in ["", "file-sha256=", "symlink-sha256="] {
+            let hash = format!("{prefix}{}", "A".repeat(64));
+            let info = ArkInfo::parse(&record(&hash)).unwrap();
+            assert_eq!(info.file_hashes, vec![(PathBuf::from(path), hash)]);
+            assert_eq!(ArkInfo::parse(&info.to_string_pretty()).unwrap(), info);
+        }
+        for hash in [
+            format!("directory-sha256={}", "a".repeat(64)),
+            format!("file-sha256={}", "a".repeat(63)),
+            format!("symlink-sha256={}", "g".repeat(64)),
+            format!("symlink-sha256={}", "a".repeat(65)),
+            "file-sha256=".to_string(),
+        ] {
+            assert!(ArkInfo::parse(&record(&hash)).is_err(), "accepted {hash}");
+        }
     }
 
     #[test]
