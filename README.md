@@ -17,3 +17,6 @@ bytes) of decoded `ARKPKG` metadata. The complete metadata entry must be within
 the first 16 MiB (16,777,216 bytes) of decoded tar data, including headers,
 padding, skipped payloads, and tar extension records. Packages exceeding these
 limits are rejected. `arkpkg-build` places `ARKPKG` before the package payload.
+
+This reader limit is separate from repository publishing: the current
+`arkpkg-repo` index builder requires `ARKPKG` metadata to be at most 64 KiB.

@@ -113,7 +113,8 @@ impl Logger {
         println!("{}", escaped);
         let timestamp = chrono::Utc::now().to_rfc3339();
         if let Ok(mut file) = self.open_log_file() {
-            let _ = writeln!(file, "[{}] {}", timestamp, escaped);
+            let record = format!("[{}] {}\n", timestamp, escaped);
+            let _ = file.write_all(record.as_bytes());
         }
     }
 }
