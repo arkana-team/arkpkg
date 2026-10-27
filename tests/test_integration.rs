@@ -727,3 +727,49 @@ fn installer_rejects_database_state_payloads_even_with_force() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_database_state_through_etc_config_alias() {
+    use std::os::unix::fs::symlink;
+
+    for relative in [
+        "config/arkpkg/package.db",
+        "config/arkpkg/packages/x.arkinfo",
+    ] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("config/arkpkg/packages")).unwrap();
+        symlink("config", root.path().join("etc")).unwrap();
+        let payload = source.path().join("package").join(relative);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"replacement").unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: statealiasattack\nDescription: reject database aliases\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let archive = output.path().join("attack.ark");
+        create_ark(source.path(), &archive).unwrap();
+
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        db.add_installed_package("existing", &Version::parse("1.0").unwrap())
+            .unwrap();
+        let package_db = root.path().join("config/arkpkg/package.db");
+        let package_db_before = fs::read(&package_db).unwrap();
+        let arkinfo = root.path().join("config/arkpkg/packages/x.arkinfo");
+        fs::write(&arkinfo, b"original metadata").unwrap();
+
+        let logger = Logger::new(root.path());
+        let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+        assert!(matches!(
+            installer.install(&archive),
+            Err(ArkError::InvalidPackage(_))
+        ));
+        assert_eq!(fs::read(package_db).unwrap(), package_db_before);
+        assert_eq!(fs::read(arkinfo).unwrap(), b"original metadata");
+        assert!(db.is_installed("existing").unwrap().is_some());
+    }
+}

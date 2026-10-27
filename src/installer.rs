@@ -216,6 +216,7 @@ impl<'a> Installer<'a> {
                         )
                     })?;
                 validate_payload_path(resolved_relative)?;
+                validate_database_destination(&canonical_root, &destination)?;
                 if !destinations.insert(destination.clone()) {
                     return Err(ArkError::InvalidPackage(format!(
                         "Multiple package files resolve to '{}'",
@@ -274,6 +275,7 @@ impl<'a> Installer<'a> {
                         )
                     })?;
                 validate_payload_path(resolved_relative)?;
+                validate_database_destination(&canonical_root, &destination)?;
                 if destination != *planned_destination {
                     return Err(ArkError::InvalidPackage(format!(
                         "Install destination for '{}' changed during installation",
@@ -494,6 +496,25 @@ fn resolve_destination(root: &Path, relative: &Path, create_parent: bool) -> Res
         .file_name()
         .ok_or_else(|| ArkError::InvalidPackage("Install path has no file name".into()))?;
     Ok(current.join(name))
+}
+
+/// Reject resolved destinations that overlap package-manager state, including
+/// paths that reach it through supported in-root directory symlinks.
+fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> {
+    for relative in [
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages",
+    ] {
+        let reserved = resolve_destination(root, Path::new(relative), false)?;
+        if destination.starts_with(&reserved) || reserved.starts_with(destination) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package file '{}' overlaps reserved database state",
+                destination.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether overwriting this destination requires consent and preservation.
