@@ -126,7 +126,13 @@ impl RepositoryManager {
             ArkError::Generic(format!("Could not encode repository config: {error}"))
         })?;
         temporary.write_all(b"\n")?;
-        temporary.replace(filename)?;
+        publish_new_config(temporary, &directory, &filename).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ArkError::Generic(format!("Repository '{}' already exists", name))
+            } else {
+                error.into()
+            }
+        })?;
         Ok(())
     }
 
@@ -385,6 +391,49 @@ impl RepositoryManager {
         }
         Ok(index.packages)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_new_config(
+    temporary: TempFile<'_>,
+    directory: &Dir,
+    filename: &str,
+) -> std::io::Result<()> {
+    use rustix::fs::AtFlags;
+
+    // Linking the open file descriptor publishes the completed config in one
+    // operation and fails if another add has already created this name.
+    let proc_self_fd = rustix_linux_procfs::proc_self_fd().map_err(std::io::Error::from)?;
+    let descriptor = rustix::path::DecInt::from_fd(temporary.as_file());
+    rustix::fs::linkat(
+        proc_self_fd,
+        descriptor.as_c_str(),
+        directory,
+        filename,
+        AtFlags::SYMLINK_FOLLOW,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn publish_new_config(
+    mut temporary: TempFile<'_>,
+    directory: &Dir,
+    filename: &str,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut destination = directory.open_with(filename, &options)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        destination.set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.rewind()?;
+    std::io::copy(&mut temporary, &mut destination)?;
+    Ok(())
 }
 
 fn rooted_download_tempfile(root: &Path) -> Result<NamedTempFile> {
@@ -858,6 +907,26 @@ mod tests {
         );
         repositories.remove("main").unwrap();
         assert!(repositories.list().unwrap().is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn repository_config_publication_does_not_replace_existing_file() {
+        let root = TempDir::new().unwrap();
+        let existing_contents = br#"{"name":"main","url":"https://old.example"}"#;
+        fs::write(root.path().join("main.json"), existing_contents).unwrap();
+        let directory = Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let mut temporary = TempFile::new(&directory).unwrap();
+        temporary.write_all(b"replacement config").unwrap();
+
+        let error = publish_new_config(temporary, &directory, "main.json").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(root.path().join("main.json")).unwrap(),
+            existing_contents
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
