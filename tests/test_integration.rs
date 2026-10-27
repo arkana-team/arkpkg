@@ -10,6 +10,7 @@ use arkpkg::version::Version;
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
@@ -105,6 +106,53 @@ fn verifier_detects_modified_installed_files() {
         Verifier::new(&db).verify("tampercheck"),
         Err(ArkError::VerificationFailed(_))
     ));
+}
+
+#[test]
+fn verifier_requires_expected_hashes_for_success() {
+    let fake_root_dir = TempDir::new().unwrap();
+    let db = Database::new(fake_root_dir.path());
+    db.init().unwrap();
+    let installed = fake_root_dir.path().join("usr/bin/legacy");
+    let metadata_path = fake_root_dir
+        .path()
+        .join("etc/arkpkg/packages/legacy.arkinfo");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    let content = b"installed content without a trusted baseline";
+    fs::write(&installed, content).unwrap();
+
+    let expected_hash = arkpkg::checksum::compute_sha256_bytes(content);
+    for (hashes, expected_exit) in [
+        (String::new(), 5),
+        ("FileHashes:\n".to_string(), 5),
+        (format!("FileHashes:\n/usr/bin/legacy:{expected_hash}\n"), 0),
+    ] {
+        let metadata = format!("Name: legacy\nVersion: 1.0.0\nFiles:\n/usr/bin/legacy\n{hashes}");
+        fs::write(&metadata_path, &metadata).unwrap();
+
+        let result = Verifier::new(&db).verify("legacy");
+        if expected_exit == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
+        }
+
+        let output = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+            .arg("--root")
+            .arg(fake_root_dir.path())
+            .args(["verify", "legacy"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_exit));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if expected_exit != 0 {
+            assert!(stdout.contains("UNVERIFIED /usr/bin/legacy (legacy metadata)"));
+        } else {
+            assert!(stdout.contains("OK      /usr/bin/legacy"));
+        }
+        assert_eq!(fs::read(&installed).unwrap(), content);
+        assert_eq!(fs::read_to_string(&metadata_path).unwrap(), metadata);
+    }
 }
 
 #[test]

@@ -22,6 +22,7 @@ impl<'a> Verifier<'a> {
     }
 
     /// Verifies all installed files of a package.
+    /// Fails if a managed file is missing, modified, or lacks an expected hash.
     pub fn verify(&self, pkg_name: &str) -> Result<Vec<VerifyStatus>> {
         let arkinfo = self.db.read_arkinfo(pkg_name).map_err(|_| {
             ArkError::PackageNotFound(format!("Package '{}' is not installed", pkg_name))
@@ -77,6 +78,7 @@ impl<'a> Verifier<'a> {
                     } else {
                         println!("UNVERIFIED {} (legacy metadata)", file_rel.display());
                         results.push(VerifyStatus::Unverified(file_rel.clone()));
+                        failed = true;
                     }
                 }
                 Ok(_) => {
