@@ -1,8 +1,9 @@
+use cap_std::fs::{Dir, OpenOptions};
+use cap_tempfile::TempFile;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use tempfile::NamedTempFile;
 
 use crate::errors::{ArkError, Result};
 use crate::metadata::{ProvideItem, validate_package_atom, validate_package_name};
@@ -342,15 +343,15 @@ impl Database {
     }
 
     fn package_db_path(&self) -> PathBuf {
-        self.root.join("etc/arkpkg/package.db")
+        PathBuf::from("etc/arkpkg/package.db")
     }
 
     fn file_db_path(&self) -> PathBuf {
-        self.root.join("etc/arkpkg/file.db")
+        PathBuf::from("etc/arkpkg/file.db")
     }
 
     fn packages_dir(&self) -> PathBuf {
-        self.root.join("etc/arkpkg/packages")
+        PathBuf::from("etc/arkpkg/packages")
     }
 
     fn arkinfo_path(&self, pkg_name: &str) -> Result<PathBuf> {
@@ -358,28 +359,67 @@ impl Database {
         Ok(self.packages_dir().join(format!("{}.arkinfo", pkg_name)))
     }
 
-    /// Ensures that database directories exist.
+    // Only the selected root is opened with ambient filesystem access. Every
+    // database path below it is resolved through a confined directory handle.
+    fn open_root(&self) -> std::io::Result<Dir> {
+        Dir::open_ambient_dir(&self.root, cap_std::ambient_authority())
+    }
+
+    fn initialized_root(&self) -> Result<Dir> {
+        fs::create_dir_all(&self.root)?;
+        let root = self.open_root()?;
+        root.create_dir_all(self.packages_dir())?;
+        root.create_dir_all("var/log")?;
+        for path in [self.package_db_path(), self.file_db_path()] {
+            match root.metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Confined creation also permits dangling links within the
+                    // root, without truncating a file created concurrently.
+                    root.open_with(&path, OpenOptions::new().write(true).create(true))?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(root)
+    }
+
+    /// Ensures that database directories exist beneath the selected root.
     pub fn init(&self) -> Result<()> {
-        let db_dir = self.root.join("etc/arkpkg");
-        fs::create_dir_all(&db_dir)?;
-        fs::create_dir_all(self.packages_dir())?;
+        self.initialized_root().map(|_| ())
+    }
 
-        let log_dir = self.root.join("var/log");
-        fs::create_dir_all(&log_dir)?;
-
-        if !self.package_db_path().exists() {
-            File::create(self.package_db_path())?;
+    fn atomic_write(
+        &self,
+        directory: &Path,
+        filename: &str,
+        write: impl FnOnce(&mut TempFile<'_>) -> std::io::Result<()>,
+    ) -> Result<()> {
+        let directory = self.open_root()?.open_dir(directory)?;
+        let mut temp_file = TempFile::new(&directory)?;
+        // Preserve NamedTempFile's private Unix permissions.
+        #[cfg(unix)]
+        {
+            use cap_std::fs::PermissionsExt;
+            temp_file
+                .as_file()
+                .set_permissions(cap_std::fs::Permissions::from_mode(0o600))?;
         }
-        if !self.file_db_path().exists() {
-            File::create(self.file_db_path())?;
-        }
+        write(&mut temp_file)?;
+        temp_file.flush()?;
+        // Creation, replacement and cleanup all use the same open directory,
+        // even if its original pathname is replaced by a symlink meanwhile.
+        temp_file.replace(filename).map_err(|error| {
+            ArkError::Io(std::io::Error::other(format!(
+                "Failed to persist {filename}: {error}"
+            )))
+        })?;
         Ok(())
     }
 
     /// Reads all installed packages from `package.db`.
     pub fn read_installed_packages(&self) -> Result<Vec<(String, Version)>> {
-        self.init()?;
-        let file = File::open(self.package_db_path())?;
+        let file = self.initialized_root()?.open(self.package_db_path())?;
         let reader = BufReader::new(file);
         let mut list = Vec::new();
 
@@ -439,25 +479,17 @@ impl Database {
     }
 
     fn atomic_write_package_db(&self, pkgs: &[(String, Version)]) -> Result<()> {
-        let db_dir = self.root.join("etc/arkpkg");
-        let mut temp_file = NamedTempFile::new_in(&db_dir)?;
-
-        for (n, v) in pkgs {
-            writeln!(temp_file, "{} {}", n, v)?;
-        }
-        temp_file.flush()?;
-        temp_file.persist(self.package_db_path()).map_err(|error| {
-            ArkError::Io(std::io::Error::other(format!(
-                "Failed to persist package.db: {error}"
-            )))
-        })?;
-        Ok(())
+        self.atomic_write(Path::new("etc/arkpkg"), "package.db", |temp_file| {
+            for (n, v) in pkgs {
+                writeln!(temp_file, "{} {}", n, v)?;
+            }
+            Ok(())
+        })
     }
 
     /// Reads all file ownership mappings from `file.db`.
     pub fn read_file_ownership(&self) -> Result<HashMap<PathBuf, String>> {
-        self.init()?;
-        let file = File::open(self.file_db_path())?;
+        let file = self.initialized_root()?.open(self.file_db_path())?;
         let reader = BufReader::new(file);
         let mut map = HashMap::new();
 
@@ -536,19 +568,12 @@ impl Database {
     }
 
     fn atomic_write_file_db(&self, map: &HashMap<PathBuf, String>) -> Result<()> {
-        let db_dir = self.root.join("etc/arkpkg");
-        let mut temp_file = NamedTempFile::new_in(&db_dir)?;
-
-        for (path, pkg) in map {
-            writeln!(temp_file, "{}={}", path.display(), pkg)?;
-        }
-        temp_file.flush()?;
-        temp_file.persist(self.file_db_path()).map_err(|error| {
-            ArkError::Io(std::io::Error::other(format!(
-                "Failed to persist file.db: {error}"
-            )))
-        })?;
-        Ok(())
+        self.atomic_write(Path::new("etc/arkpkg"), "file.db", |temp_file| {
+            for (path, pkg) in map {
+                writeln!(temp_file, "{}={}", path.display(), pkg)?;
+            }
+            Ok(())
+        })
     }
 
     /// Atomically writes an `.arkinfo` file for an installed package.
@@ -559,28 +584,26 @@ impl Database {
         for path in &arkinfo.files {
             validate_installed_path(path)?;
         }
-        let target_path = self.arkinfo_path(&arkinfo.name)?;
-        let mut temp_file = NamedTempFile::new_in(self.packages_dir())?;
-        temp_file.write_all(arkinfo.to_string_pretty().as_bytes())?;
-        temp_file.flush()?;
-        temp_file.persist(target_path).map_err(|error| {
-            ArkError::Io(std::io::Error::other(format!(
-                "Failed to persist arkinfo: {error}"
-            )))
-        })?;
-        Ok(())
+        self.atomic_write(
+            &self.packages_dir(),
+            &format!("{}.arkinfo", arkinfo.name),
+            |temp_file| temp_file.write_all(arkinfo.to_string_pretty().as_bytes()),
+        )
     }
 
     /// Reads `.arkinfo` for an installed package.
     pub fn read_arkinfo(&self, pkg_name: &str) -> Result<ArkInfo> {
         let path = self.arkinfo_path(pkg_name)?;
-        if !path.exists() {
-            return Err(ArkError::PackageNotFound(format!(
-                "Package metadata info for '{}' not found",
-                pkg_name
-            )));
-        }
-        let content = fs::read_to_string(path)?;
+        let content = match self.open_root().and_then(|root| root.read_to_string(&path)) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ArkError::PackageNotFound(format!(
+                    "Package metadata info for '{}' not found",
+                    pkg_name
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let arkinfo = ArkInfo::parse(&content)?;
         if !arkinfo.name.eq_ignore_ascii_case(pkg_name) {
             return Err(ArkError::InvalidPackage(format!(
@@ -594,10 +617,11 @@ impl Database {
     /// Deletes the `.arkinfo` file for a package.
     pub fn remove_arkinfo(&self, pkg_name: &str) -> Result<()> {
         let path = self.arkinfo_path(pkg_name)?;
-        if path.exists() {
-            fs::remove_file(path)?;
+        match self.open_root().and_then(|root| root.remove_file(&path)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 }
 
@@ -605,6 +629,251 @@ impl Database {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn sample_arkinfo() -> ArkInfo {
+        ArkInfo::parse("Name: sample\nVersion: 1.0\nFiles:\n/usr/bin/sample\n").unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn initialization_rejects_escaping_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for relative in ["etc", "etc/arkpkg", "etc/arkpkg/packages", "var", "var/log"] {
+            for absolute in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let outside = temp.path().join("outside");
+                fs::create_dir_all(&root).unwrap();
+                fs::create_dir(&outside).unwrap();
+                let link = root.join(relative);
+                fs::create_dir_all(link.parent().unwrap()).unwrap();
+                let target = if absolute {
+                    outside.clone()
+                } else {
+                    let mut target = PathBuf::new();
+                    for _ in 0..Path::new(relative).components().count() {
+                        target.push("..");
+                    }
+                    target.join("outside")
+                };
+                symlink(target, &link).unwrap();
+
+                assert!(Database::new(&root).init().is_err(), "accepted {link:?}");
+                assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn database_operations_reject_escaping_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for relative in ["etc", "etc/arkpkg", "etc/arkpkg/packages"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let outside_db = Database::new(outside.path());
+            let info = sample_arkinfo();
+            outside_db
+                .add_installed_package("sample", &info.version)
+                .unwrap();
+            outside_db
+                .add_file_ownership(&info.files, "sample")
+                .unwrap();
+            outside_db.write_arkinfo(&info).unwrap();
+            let paths = [
+                "etc/arkpkg/package.db",
+                "etc/arkpkg/file.db",
+                "etc/arkpkg/packages/sample.arkinfo",
+            ];
+            let before: Vec<_> = paths
+                .iter()
+                .map(|p| fs::read(outside.path().join(p)).unwrap())
+                .collect();
+            let link = root.path().join(relative);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(outside.path().join(relative), &link).unwrap();
+            let db = Database::new(root.path());
+
+            assert!(db.init().is_err());
+            assert!(db.read_installed_packages().is_err());
+            assert!(db.read_file_ownership().is_err());
+            assert!(db.read_arkinfo("sample").is_err());
+            assert!(db.add_installed_package("changed", &info.version).is_err());
+            assert!(db.remove_installed_package("sample").is_err());
+            assert!(db.add_file_ownership(&info.files, "changed").is_err());
+            assert!(db.remove_file_ownership(&info.files).is_err());
+            if relative != "etc/arkpkg/packages" {
+                let mut ownership = outside_db.read_file_ownership().unwrap();
+                let original_ownership = ownership.clone();
+                assert!(
+                    db.add_file_ownership_from_map(&mut ownership, &info.files, "changed")
+                        .is_err()
+                );
+                assert_eq!(ownership, original_ownership);
+            }
+            assert!(db.write_arkinfo(&info).is_err());
+            assert!(db.remove_arkinfo("sample").is_err());
+
+            for (path, content) in paths.iter().zip(before) {
+                assert_eq!(fs::read(outside.path().join(path)).unwrap(), content);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn database_files_cannot_follow_escaping_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for relative in ["etc/arkpkg/package.db", "etc/arkpkg/file.db"] {
+            for dangling in [false, true] {
+                let root = TempDir::new().unwrap();
+                let outside = TempDir::new().unwrap();
+                let db = Database::new(root.path());
+                db.init().unwrap();
+                let target = outside.path().join("database");
+                if !dangling {
+                    fs::write(&target, "sample 1.0\n").unwrap();
+                }
+                fs::remove_file(root.path().join(relative)).unwrap();
+                symlink(&target, root.path().join(relative)).unwrap();
+
+                assert!(db.init().is_err());
+                assert!(db.read_installed_packages().is_err());
+                assert!(db.read_file_ownership().is_err());
+                assert!(
+                    db.add_installed_package("sample", &Version::parse("2.0").unwrap())
+                        .is_err()
+                );
+                assert!(
+                    db.add_file_ownership(&[PathBuf::from("/usr/bin/sample")], "sample")
+                        .is_err()
+                );
+                if dangling {
+                    assert!(!target.exists());
+                } else {
+                    assert_eq!(fs::read_to_string(target).unwrap(), "sample 1.0\n");
+                }
+            }
+        }
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        let target = outside.path().join("sample.arkinfo");
+        let info = sample_arkinfo();
+        fs::write(&target, info.to_string_pretty()).unwrap();
+        let link = root.path().join("etc/arkpkg/packages/sample.arkinfo");
+        symlink(&target, &link).unwrap();
+        assert!(db.read_arkinfo("sample").is_err());
+        // Replacement and deletion operate on the link, preserving its target.
+        db.write_arkinfo(&info).unwrap();
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(db.read_arkinfo("sample").unwrap(), info);
+        fs::remove_file(&link).unwrap();
+        symlink(&target, &link).unwrap();
+        db.remove_arkinfo("sample").unwrap();
+        assert!(!link.exists());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            info.to_string_pretty()
+        );
+        fs::remove_file(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        db.remove_arkinfo("sample").unwrap();
+        assert!(fs::symlink_metadata(link).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relative_directory_symlinks_within_root_remain_usable() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("state/arkpkg")).unwrap();
+        fs::create_dir(root.path().join("metadata")).unwrap();
+        symlink("state", root.path().join("etc")).unwrap();
+        symlink("../../metadata", root.path().join("state/arkpkg/packages")).unwrap();
+        symlink(
+            "../../package-index",
+            root.path().join("state/arkpkg/package.db"),
+        )
+        .unwrap();
+        symlink(
+            "../../ownership-index",
+            root.path().join("state/arkpkg/file.db"),
+        )
+        .unwrap();
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        assert!(root.path().join("package-index").is_file());
+        assert!(root.path().join("ownership-index").is_file());
+        let info = sample_arkinfo();
+        db.add_installed_package("sample", &info.version).unwrap();
+        db.add_file_ownership(&info.files, "sample").unwrap();
+        db.write_arkinfo(&info).unwrap();
+        assert_eq!(db.read_arkinfo("sample").unwrap(), info);
+        assert_eq!(db.is_installed("sample").unwrap(), Some(info.version));
+        assert_eq!(
+            db.get_file_owner(&info.files[0]).unwrap().as_deref(),
+            Some("sample")
+        );
+        assert!(root.path().join("metadata/sample.arkinfo").exists());
+        db.remove_arkinfo("sample").unwrap();
+        db.remove_installed_package("sample").unwrap();
+        db.remove_file_ownership(&info.files).unwrap();
+        assert!(db.read_installed_packages().unwrap().is_empty());
+        assert!(db.read_file_ownership().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_replacement_keeps_the_open_directory_when_parent_is_swapped() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        fs::write(outside.path().join("package.db"), "outside 1.0\n").unwrap();
+        db.atomic_write(Path::new("etc/arkpkg"), "package.db", |file| {
+            fs::rename(
+                root.path().join("etc/arkpkg"),
+                root.path().join("etc/original"),
+            )?;
+            symlink(outside.path(), root.path().join("etc/arkpkg"))?;
+            file.write_all(b"sample 1.0\n")
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.path().join("package.db")).unwrap(),
+            "outside 1.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("etc/original/package.db")).unwrap(),
+            "sample 1.0\n"
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.path().join("etc/original/package.db"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn test_database_operations() {
@@ -671,8 +940,8 @@ mod tests {
         let mut ownership = db.read_file_ownership().unwrap();
         let before = ownership.clone();
 
-        fs::remove_file(db.file_db_path()).unwrap();
-        fs::create_dir(db.file_db_path()).unwrap();
+        fs::remove_file(temp_dir.path().join(db.file_db_path())).unwrap();
+        fs::create_dir(temp_dir.path().join(db.file_db_path())).unwrap();
 
         let added = PathBuf::from("/usr/bin/added");
         assert!(
