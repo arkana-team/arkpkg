@@ -14,6 +14,68 @@ use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
+fn installer_logs_untrusted_paths_as_single_records() {
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: loginjection\nDescription: log integrity test\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    let filename = "tool\n[2000-01-01T00:00:00Z] INFO DONE\r\u{1b}[2J";
+    let payload_dir = source.path().join("package/usr/bin");
+    fs::create_dir_all(&payload_dir).unwrap();
+    fs::write(payload_dir.join(filename), b"payload").unwrap();
+    let archive = output.path().join("package\r\nINFO DONE.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("--yes")
+        .arg("install")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("Unsafe installed file path")
+    );
+
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.ends_with(r"/package\r\nINFO DONE.ark"))
+    );
+    assert!(stdout.lines().any(|line| {
+        line == r"COPY /usr/bin/tool\n[2000-01-01T00:00:00Z] INFO DONE\r\u{1b}[2J"
+    }));
+    assert!(!stdout.chars().any(|c| c.is_control() && c != '\n'));
+    let log = fs::read_to_string(root.path().join("var/log/arkpkg.log")).unwrap();
+    let records: Vec<_> = log
+        .lines()
+        .map(|line| {
+            let (timestamp, record) = line.split_once("] ").unwrap();
+            chrono::DateTime::parse_from_rfc3339(timestamp.strip_prefix('[').unwrap()).unwrap();
+            record
+        })
+        .collect();
+    assert_eq!(records, stdout.lines().collect::<Vec<_>>());
+    assert!(!records.contains(&"INFO DONE"));
+    assert!(!root.path().join("usr/bin").join(filename).exists());
+    assert!(
+        Database::new(root.path())
+            .is_installed("loginjection")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn test_full_package_lifecycle() {
     let pkg_source_dir = TempDir::new().unwrap();
     let fake_root_dir = TempDir::new().unwrap();
