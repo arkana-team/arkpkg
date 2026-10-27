@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use url::Url;
 
+use crate::archive::{ArchiveReader, MAX_DECODED_ARCHIVE_BYTES};
 use crate::checksum::compute_sha256_file;
 use crate::errors::{ArkError, Result};
 use crate::metadata::{Metadata, validate_package_name};
@@ -477,7 +478,7 @@ fn request(url: &str, limit: u64) -> Result<ureq::Response> {
 fn read_archive_metadata(path: &Path) -> Result<Metadata> {
     let file = File::open(path)?;
     let decoder = FrameDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(ArchiveReader::new(decoder, MAX_DECODED_ARCHIVE_BYTES));
     let entries = archive
         .entries()
         .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
