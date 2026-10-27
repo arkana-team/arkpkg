@@ -25,6 +25,11 @@ pub(crate) fn read_metadata(reader: impl Read, declared_size: u64) -> Result<Met
         .take(MAX_METADATA_SIZE + 1)
         .read_to_string(&mut content)?;
     check_metadata_size(content.len() as u64)?;
+    if content.len() as u64 != declared_size {
+        return Err(ArkError::InvalidPackage(
+            "Incomplete ARKPKG metadata within the decoded search limit".into(),
+        ));
+    }
     Metadata::parse(&content)
 }
 

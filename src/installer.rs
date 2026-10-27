@@ -6,8 +6,8 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
-use crate::checksum::{compute_sha256_file, compute_sha256_path};
-use crate::database::{ArkInfo, Database, validate_payload_path};
+use crate::checksum::{compute_integrity_path, compute_sha256_file};
+use crate::database::{ArkInfo, Database, validate_installed_path, validate_payload_path};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
 use crate::prompt::PromptHandler;
@@ -206,6 +206,9 @@ impl<'a> Installer<'a> {
                 )));
             }
 
+            let install_rel_path = PathBuf::from("/").join(relative);
+            validate_installed_path(&install_rel_path)?;
+
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
                 validate_payload_path(relative)?;
                 let destination = resolve_destination(&canonical_root, relative, false)?;
@@ -215,6 +218,7 @@ impl<'a> Installer<'a> {
                             "Install destination resolves outside target root".into(),
                         )
                     })?;
+                validate_installed_path(&PathBuf::from("/").join(resolved_relative))?;
                 validate_payload_path(resolved_relative)?;
                 validate_database_destination(&canonical_root, &destination)?;
                 if !destinations.insert(destination.clone()) {
@@ -341,7 +345,7 @@ impl<'a> Installer<'a> {
                 return Err(error);
             }
             let installed_path = install_rel_path;
-            let file_hash = match compute_sha256_path(&dest_path) {
+            let file_hash = match compute_integrity_path(&dest_path) {
                 Ok(hash) => hash,
                 Err(error) => {
                     self.rollback(&file_changes);

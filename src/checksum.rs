@@ -29,22 +29,45 @@ pub fn compute_sha256_bytes(bytes: &[u8]) -> String {
 
 /// Computes the SHA-256 hash of a regular file or of a symlink's stored target.
 pub fn compute_sha256_path<P: AsRef<Path>>(path: P) -> IoResult<String> {
-    let path = path.as_ref();
+    Ok(compute_path_digest(path.as_ref())?.1)
+}
+
+/// Records the object type alongside its digest for installed-file verification.
+/// The tag is part of the compared value; raw archive SHA-256 values stay unchanged.
+pub(crate) fn compute_integrity_path<P: AsRef<Path>>(path: P) -> IoResult<String> {
+    let (kind, digest) = compute_path_digest(path.as_ref())?;
+    Ok(format!("{kind}{digest}"))
+}
+
+/// Returns the digest only for a recognized typed integrity record.
+pub(crate) fn typed_file_digest(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("file-sha256=")
+        .or_else(|| value.strip_prefix("symlink-sha256="))
+}
+
+fn compute_path_digest(path: &Path) -> IoResult<(&'static str, String)> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            return Ok(compute_sha256_bytes(target.as_os_str().as_bytes()));
+            return Ok((
+                "symlink-sha256=",
+                compute_sha256_bytes(target.as_os_str().as_bytes()),
+            ));
         }
         #[cfg(not(unix))]
         {
-            return Ok(compute_sha256_bytes(target.to_string_lossy().as_bytes()));
+            return Ok((
+                "symlink-sha256=",
+                compute_sha256_bytes(target.to_string_lossy().as_bytes()),
+            ));
         }
     }
     if metadata.is_file() {
-        return compute_sha256_file(path);
+        return Ok(("file-sha256=", compute_sha256_file(path)?));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,

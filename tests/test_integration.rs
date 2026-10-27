@@ -10,8 +10,73 @@ use arkpkg::version::Version;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
+
+#[test]
+fn installer_escapes_archive_path_in_logs() {
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: logguard\nDescription: log test\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    fs::create_dir(source.path().join("package")).unwrap();
+    let archive = output.path().join("package\n[forged] INFO DONE\r.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&archive).unwrap();
+
+    let log = fs::read_to_string(root.path().join("var/log/arkpkg.log")).unwrap();
+    assert!(log.contains("package\\n[forged] INFO DONE\\r.ark"));
+    assert!(!log.contains("\n[forged]"));
+    assert!(!log.contains('\r'));
+    assert!(db.is_installed("logguard").unwrap().is_some());
+}
+
+#[test]
+fn installer_rejects_unsupported_filenames_before_copying_any_files() {
+    for filename in [
+        "z-last\n[forged] INFO DONE",
+        "z-last\rINFO DONE",
+        "z-last\ttool",
+        "z-last\x1b[2J",
+        "z-last=owner",
+    ] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: logguard\nDescription: log test\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload_dir = source.path().join("package/usr/bin");
+        fs::create_dir_all(&payload_dir).unwrap();
+        fs::write(payload_dir.join("a-first"), b"valid payload").unwrap();
+        fs::write(payload_dir.join(filename), b"invalid payload").unwrap();
+        let archive = output.path().join("logguard.ark");
+        create_ark(source.path(), &archive).unwrap();
+
+        let db = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+        assert!(matches!(
+            installer.install(&archive),
+            Err(ArkError::InvalidPackage(_))
+        ));
+
+        let log = fs::read_to_string(root.path().join("var/log/arkpkg.log")).unwrap();
+        assert!(!log.contains("COPY "), "logged copy for {filename:?}");
+        assert!(!log.contains("[forged]"));
+        assert!(!root.path().join("usr").exists());
+        assert_eq!(db.is_installed("logguard").unwrap(), None);
+    }
+}
 
 #[test]
 fn test_full_package_lifecycle() {
@@ -106,53 +171,6 @@ fn verifier_detects_modified_installed_files() {
         Verifier::new(&db).verify("tampercheck"),
         Err(ArkError::VerificationFailed(_))
     ));
-}
-
-#[test]
-fn verifier_requires_expected_hashes_for_success() {
-    let fake_root_dir = TempDir::new().unwrap();
-    let db = Database::new(fake_root_dir.path());
-    db.init().unwrap();
-    let installed = fake_root_dir.path().join("usr/bin/legacy");
-    let metadata_path = fake_root_dir
-        .path()
-        .join("etc/arkpkg/packages/legacy.arkinfo");
-    fs::create_dir_all(installed.parent().unwrap()).unwrap();
-    let content = b"installed content without a trusted baseline";
-    fs::write(&installed, content).unwrap();
-
-    let expected_hash = arkpkg::checksum::compute_sha256_bytes(content);
-    for (hashes, expected_exit) in [
-        (String::new(), 5),
-        ("FileHashes:\n".to_string(), 5),
-        (format!("FileHashes:\n/usr/bin/legacy:{expected_hash}\n"), 0),
-    ] {
-        let metadata = format!("Name: legacy\nVersion: 1.0.0\nFiles:\n/usr/bin/legacy\n{hashes}");
-        fs::write(&metadata_path, &metadata).unwrap();
-
-        let result = Verifier::new(&db).verify("legacy");
-        if expected_exit == 0 {
-            assert!(result.is_ok());
-        } else {
-            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
-        }
-
-        let output = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
-            .arg("--root")
-            .arg(fake_root_dir.path())
-            .args(["verify", "legacy"])
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(expected_exit));
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        if expected_exit != 0 {
-            assert!(stdout.contains("UNVERIFIED /usr/bin/legacy (legacy metadata)"));
-        } else {
-            assert!(stdout.contains("OK      /usr/bin/legacy"));
-        }
-        assert_eq!(fs::read(&installed).unwrap(), content);
-        assert_eq!(fs::read_to_string(&metadata_path).unwrap(), metadata);
-    }
 }
 
 #[test]
@@ -775,7 +793,6 @@ fn installer_rejects_database_state_payloads_even_with_force() {
         }
     }
 }
-
 #[cfg(unix)]
 #[test]
 fn installer_rejects_database_state_through_etc_config_alias() {
@@ -824,6 +841,79 @@ fn installer_rejects_database_state_through_etc_config_alias() {
 
 #[cfg(unix)]
 #[test]
+fn verifier_rejects_file_symlink_substitutions() {
+    use arkpkg::checksum::compute_sha256_path;
+    use arkpkg::verifier::VerifyStatus;
+    use std::os::unix::fs::symlink;
+
+    for originally_symlink in [false, true] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: typecheck\nDescription: object type integrity\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload = source.path().join("package/usr/bin/tool");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        if originally_symlink {
+            symlink("target", &payload).unwrap();
+        } else {
+            fs::write(&payload, b"target").unwrap();
+        }
+        let archive = output.path().join("typecheck.ark");
+        create_ark(source.path(), &archive).unwrap();
+        let db = Database::new(root.path());
+        let logger = Logger::new(root.path());
+        logger.init().unwrap();
+        Installer::new(&db, &logger, PromptHandler::new(true, false, false))
+            .install(&archive)
+            .unwrap();
+        let installed = root.path().join("usr/bin/tool");
+        fs::write(
+            root.path().join("usr/bin/target"),
+            b"different reader content",
+        )
+        .unwrap();
+        let verifier = Verifier::new(&db);
+        assert!(matches!(
+            verifier.verify("typecheck").unwrap().as_slice(),
+            [VerifyStatus::Ok(_)]
+        ));
+        // Digest hex remains case-insensitive in typed records as in legacy records.
+        let mut info = db.read_arkinfo("typecheck").unwrap();
+        for (_, hash) in &mut info.file_hashes {
+            let (tag, digest) = hash.split_once('=').unwrap();
+            *hash = format!("{tag}={}", digest.to_ascii_uppercase());
+        }
+        db.write_arkinfo(&info).unwrap();
+        assert!(matches!(
+            verifier.verify("typecheck").unwrap().as_slice(),
+            [VerifyStatus::Ok(_)]
+        ));
+        let original_hash = compute_sha256_path(&installed).unwrap();
+        let original_content = fs::read(&installed).unwrap();
+        fs::remove_file(&installed).unwrap();
+        if originally_symlink {
+            fs::write(&installed, b"target").unwrap();
+        } else {
+            symlink("target", &installed).unwrap();
+        }
+        assert_eq!(compute_sha256_path(&installed).unwrap(), original_hash);
+        assert_ne!(fs::read(&installed).unwrap(), original_content);
+        assert!(
+            matches!(
+                verifier.verify("typecheck"),
+                Err(ArkError::VerificationFailed(_))
+            ),
+            "accepted substitution (originally_symlink={originally_symlink})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn installer_rejects_package_metadata_alias_targets() {
     use std::os::unix::fs::symlink;
 
@@ -862,4 +952,112 @@ fn installer_rejects_package_metadata_alias_targets() {
         Err(ArkError::InvalidPackage(_))
     ));
     assert_eq!(fs::read(arkinfo).unwrap(), b"original metadata");
+}
+
+#[cfg(unix)]
+#[test]
+fn verifier_does_not_certify_legacy_object_types() {
+    use arkpkg::checksum::compute_sha256_bytes;
+    use arkpkg::database::ArkInfo;
+    use arkpkg::verifier::VerifyStatus;
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let db = Database::new(root.path());
+    let installed = root.path().join("tool");
+    let base = "Name: legacy\nVersion: 1.0\nFiles:\n/tool\n";
+    for hashes in [
+        String::new(),
+        format!("FileHashes:\n/tool:{}\n", compute_sha256_bytes(b"target")),
+    ] {
+        db.write_arkinfo(&ArkInfo::parse(&format!("{base}{hashes}")).unwrap())
+            .unwrap();
+        fs::write(&installed, b"target").unwrap();
+        let verifier = Verifier::new(&db);
+        let result = verifier.verify("legacy");
+        if hashes.is_empty() {
+            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
+        } else {
+            assert!(matches!(
+                result.unwrap().as_slice(),
+                [VerifyStatus::Unverified(_)]
+            ));
+        }
+        fs::remove_file(&installed).unwrap();
+        symlink("target", &installed).unwrap();
+        let result = verifier.verify("legacy");
+        if hashes.is_empty() {
+            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
+        } else {
+            assert!(matches!(
+                result.unwrap().as_slice(),
+                [VerifyStatus::Unverified(_)]
+            ));
+        }
+        fs::remove_file(&installed).unwrap();
+        if !hashes.is_empty() {
+            fs::write(&installed, b"changed").unwrap();
+            assert!(matches!(
+                verifier.verify("legacy"),
+                Err(ArkError::VerificationFailed(_))
+            ));
+            fs::remove_file(&installed).unwrap();
+        }
+        assert!(matches!(
+            verifier.verify("legacy"),
+            Err(ArkError::VerificationFailed(_))
+        ));
+    }
+}
+
+#[test]
+fn verifier_requires_expected_hashes_for_success() {
+    use std::process::Command;
+
+    let fake_root_dir = TempDir::new().unwrap();
+    let db = Database::new(fake_root_dir.path());
+    db.init().unwrap();
+    let installed = fake_root_dir.path().join("usr/bin/legacy");
+    let metadata_path = fake_root_dir
+        .path()
+        .join("etc/arkpkg/packages/legacy.arkinfo");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    let content = b"installed content without a trusted baseline";
+    fs::write(&installed, content).unwrap();
+
+    let expected_hash = format!(
+        "file-sha256={}",
+        arkpkg::checksum::compute_sha256_bytes(content)
+    );
+    for (hashes, expected_exit) in [
+        (String::new(), 5),
+        ("FileHashes:\n".to_string(), 5),
+        (format!("FileHashes:\n/usr/bin/legacy:{expected_hash}\n"), 0),
+    ] {
+        let metadata = format!("Name: legacy\nVersion: 1.0.0\nFiles:\n/usr/bin/legacy\n{hashes}");
+        fs::write(&metadata_path, &metadata).unwrap();
+
+        let result = Verifier::new(&db).verify("legacy");
+        if expected_exit == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
+        }
+
+        let output = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+            .arg("--root")
+            .arg(fake_root_dir.path())
+            .args(["verify", "legacy"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_exit));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if expected_exit != 0 {
+            assert!(stdout.contains("UNVERIFIED /usr/bin/legacy (legacy metadata)"));
+        } else {
+            assert!(stdout.contains("OK      /usr/bin/legacy"));
+        }
+        assert_eq!(fs::read(&installed).unwrap(), content);
+        assert_eq!(fs::read_to_string(&metadata_path).unwrap(), metadata);
+    }
 }

@@ -9,3 +9,11 @@
 > We do not provide any guarantees for the correct operation of this code.
 
 to understand how the arkana package manager works, read https://debarkak.xyz/notes/arkanaos-package-manager/
+
+## Repository package metadata limits
+
+When validating a downloaded package, arkpkg accepts at most 1 MiB (1,048,576
+bytes) of decoded `ARKPKG` metadata. The complete metadata entry must be within
+the first 16 MiB (16,777,216 bytes) of decoded tar data, including headers,
+padding, skipped payloads, and tar extension records. Packages exceeding these
+limits are rejected. `arkpkg-build` places `ARKPKG` before the package payload.
