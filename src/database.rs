@@ -298,12 +298,16 @@ fn validate_preserved_files(
     files: &[PathBuf],
     preserved_files: &[(PathBuf, PathBuf)],
 ) -> Result<()> {
+    if preserved_files.is_empty() {
+        return Ok(());
+    }
+    let file_paths: HashSet<_> = files.iter().collect();
     let mut originals = HashSet::new();
     let mut backups = HashSet::new();
     for (original, backup) in preserved_files {
         validate_installed_path(original)?;
         validate_installed_path(backup)?;
-        if !files.contains(original) {
+        if !file_paths.contains(original) {
             return Err(ArkError::InvalidPackage(format!(
                 "Preserved path '{}' is not owned by this package",
                 original.display()
@@ -316,7 +320,7 @@ fn validate_preserved_files(
                 original.display()
             )));
         }
-        if files.contains(backup) || !originals.insert(original) || !backups.insert(backup) {
+        if file_paths.contains(backup) || !originals.insert(original) || !backups.insert(backup) {
             return Err(ArkError::InvalidPackage(format!(
                 "Duplicate or conflicting preserved path '{}'",
                 original.display()
@@ -909,6 +913,40 @@ mod tests {
             ArkInfo::parse("Name: sample\nVersion: 1.0.0\nFiles:\n/usr/bin/sample\n").unwrap();
         assert!(arkinfo.preserved_files.is_empty());
         assert!(arkinfo.file_hashes.is_empty());
+    }
+
+    #[test]
+    fn parses_many_preserved_files_in_order() {
+        let mut expected = ArkInfo::parse("Name: sample\nVersion: 1.0\n").unwrap();
+        expected.files = (0..4096)
+            .map(|index| PathBuf::from(format!("/usr/bin/tool-{index}")))
+            .collect();
+        expected.preserved_files = expected
+            .files
+            .iter()
+            .rev()
+            .map(|path| (path.clone(), path.with_extension("backup")))
+            .collect();
+
+        let parsed = ArkInfo::parse(&expected.to_string_pretty()).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_conflicting_preserved_files() {
+        for entries in [
+            "/usr/bin/first=/usr/bin/second",
+            "/usr/bin/first=/usr/bin/first.backup\n/usr/bin/first=/usr/bin/other.backup",
+            "/usr/bin/first=/usr/bin/shared.backup\n/usr/bin/second=/usr/bin/shared.backup",
+        ] {
+            let content = format!(
+                "Name: sample\nVersion: 1.0\nFiles:\n/usr/bin/first\n/usr/bin/second\nPreservedFiles:\n{entries}\n"
+            );
+            assert!(
+                matches!(ArkInfo::parse(&content), Err(ArkError::InvalidPackage(_))),
+                "accepted {entries:?}"
+            );
+        }
     }
 
     #[test]
