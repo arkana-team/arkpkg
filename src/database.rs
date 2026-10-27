@@ -1,8 +1,9 @@
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
 use cap_tempfile::TempFile;
+use rustix::fs::{Mode, OFlags, openat};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -326,6 +327,24 @@ fn validate_preserved_files(
     Ok(())
 }
 
+/// Reject package payload files that overlap the package manager's own state.
+pub(crate) fn validate_payload_path(relative: &Path) -> Result<()> {
+    for reserved in [
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages",
+    ] {
+        let reserved = Path::new(reserved);
+        if relative.starts_with(reserved) || reserved.starts_with(relative) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package file '{}' overlaps reserved database state",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Package and file database manager operating under a root directory.
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -384,16 +403,26 @@ impl Database {
         root.create_dir_all("var/log")?;
         let db_dir = root.open_dir("etc/arkpkg")?;
         for name in ["package.db", "file.db"] {
-            match db_dir.open_with(name, OpenOptions::new().write(true).create_new(true)) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Check existing files through the handle too, including symlinks.
-                    db_dir.open(name)?;
-                }
-                Err(error) => return Err(error.into()),
-            }
+            Self::open_database_file(&db_dir, name, true)?;
         }
         Ok(db_dir)
+    }
+
+    fn open_database_file(dir: &Dir, name: &str, create: bool) -> Result<File> {
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let mode = if create {
+            flags |= OFlags::CREATE;
+            Mode::from_raw_mode(0o666)
+        } else {
+            Mode::empty()
+        };
+        let file = File::from(openat(dir, name, flags, mode).map_err(std::io::Error::from)?);
+        if !file.metadata()?.is_file() {
+            return Err(ArkError::InvalidPackage(format!(
+                "Database '{name}' is not a regular file"
+            )));
+        }
+        Ok(file)
     }
 
     fn temporary_file(dir: &Dir) -> Result<TempFile<'_>> {
@@ -411,7 +440,7 @@ impl Database {
     /// Reads all installed packages from `package.db`.
     pub fn read_installed_packages(&self) -> Result<Vec<(String, Version)>> {
         let db_dir = self.init_db_dir()?;
-        let file = db_dir.open("package.db")?;
+        let file = Self::open_database_file(&db_dir, "package.db", false)?;
         let reader = BufReader::new(file);
         let mut list = Vec::new();
 
@@ -489,7 +518,7 @@ impl Database {
     /// Reads all file ownership mappings from `file.db`.
     pub fn read_file_ownership(&self) -> Result<HashMap<PathBuf, String>> {
         let db_dir = self.init_db_dir()?;
-        let file = db_dir.open("file.db")?;
+        let file = Self::open_database_file(&db_dir, "file.db", false)?;
         let reader = BufReader::new(file);
         let mut map = HashMap::new();
 
@@ -661,6 +690,37 @@ mod tests {
             assert!(db.init().is_err(), "accepted {link}");
             assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_rejects_fifo_state_files_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let db_dir = root.path().join("etc/arkpkg");
+        fs::create_dir_all(&db_dir).unwrap();
+        let directory = File::open(&db_dir).unwrap();
+        rustix::fs::mkfifoat(&directory, "package.db", Mode::from_raw_mode(0o600)).unwrap();
+
+        assert!(Database::new(root.path()).init().is_err());
+    }
+
+    #[test]
+    fn package_payloads_cannot_overlap_database_state() {
+        for path in [
+            "etc",
+            "etc/arkpkg",
+            "etc/arkpkg/package.db",
+            "etc/arkpkg/file.db",
+            "etc/arkpkg/packages",
+            "etc/arkpkg/packages/sample.arkinfo",
+        ] {
+            assert!(
+                validate_payload_path(Path::new(path)).is_err(),
+                "accepted {path}"
+            );
+        }
+        assert!(validate_payload_path(Path::new("etc/arkpkg-extra/file")).is_ok());
+        assert!(validate_payload_path(Path::new("etc/profile")).is_ok());
     }
 
     #[cfg(unix)]

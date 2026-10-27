@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
 use crate::checksum::{compute_sha256_file, compute_sha256_path};
-use crate::database::{ArkInfo, Database};
+use crate::database::{ArkInfo, Database, validate_payload_path};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
 use crate::prompt::PromptHandler;
@@ -207,7 +207,16 @@ impl<'a> Installer<'a> {
             }
 
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
+                validate_payload_path(relative)?;
                 let destination = resolve_destination(&canonical_root, relative, false)?;
+                let resolved_relative =
+                    destination.strip_prefix(&canonical_root).map_err(|_| {
+                        ArkError::InvalidPackage(
+                            "Install destination resolves outside target root".into(),
+                        )
+                    })?;
+                validate_payload_path(resolved_relative)?;
+                validate_database_destination(&canonical_root, &destination)?;
                 if !destinations.insert(destination.clone()) {
                     return Err(ArkError::InvalidPackage(format!(
                         "Multiple package files resolve to '{}'",
@@ -259,6 +268,14 @@ impl<'a> Installer<'a> {
         for (src_path, rel_path, planned_destination) in &files_to_install {
             let prepared = (|| -> Result<_> {
                 let destination = resolve_destination(&canonical_root, rel_path, true)?;
+                let resolved_relative =
+                    destination.strip_prefix(&canonical_root).map_err(|_| {
+                        ArkError::InvalidPackage(
+                            "Install destination resolves outside target root".into(),
+                        )
+                    })?;
+                validate_payload_path(resolved_relative)?;
+                validate_database_destination(&canonical_root, &destination)?;
                 if destination != *planned_destination {
                     return Err(ArkError::InvalidPackage(format!(
                         "Install destination for '{}' changed during installation",
@@ -479,6 +496,49 @@ fn resolve_destination(root: &Path, relative: &Path, create_parent: bool) -> Res
         .file_name()
         .ok_or_else(|| ArkError::InvalidPackage("Install path has no file name".into()))?;
     Ok(current.join(name))
+}
+
+/// Reject resolved destinations that overlap package-manager state, including
+/// paths that reach it through supported in-root directory symlinks.
+fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> {
+    for relative in [
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages",
+    ] {
+        let mut reserved = resolve_destination(root, Path::new(relative), false)?;
+        if relative == "etc/arkpkg/packages" {
+            match fs::symlink_metadata(&reserved) {
+                Ok(_) => {
+                    reserved = reserved.canonicalize().map_err(|error| {
+                        ArkError::InvalidPackage(format!(
+                            "Reserved package metadata path cannot be resolved: {error}"
+                        ))
+                    })?;
+                    if !reserved.starts_with(root) {
+                        return Err(ArkError::InvalidPackage(format!(
+                            "Reserved package metadata path '{}' resolves outside the target root",
+                            reserved.display()
+                        )));
+                    }
+                    if !reserved.is_dir() {
+                        return Err(ArkError::InvalidPackage(
+                            "Reserved package metadata path is not a directory".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ArkError::Io(error)),
+            }
+        }
+        if destination.starts_with(&reserved) || reserved.starts_with(destination) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package file '{}' overlaps reserved database state",
+                destination.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether overwriting this destination requires consent and preservation.
