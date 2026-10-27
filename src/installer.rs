@@ -506,7 +506,31 @@ fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> 
         "etc/arkpkg/file.db",
         "etc/arkpkg/packages",
     ] {
-        let reserved = resolve_destination(root, Path::new(relative), false)?;
+        let mut reserved = resolve_destination(root, Path::new(relative), false)?;
+        if relative == "etc/arkpkg/packages" {
+            match fs::symlink_metadata(&reserved) {
+                Ok(_) => {
+                    reserved = reserved.canonicalize().map_err(|error| {
+                        ArkError::InvalidPackage(format!(
+                            "Reserved package metadata path cannot be resolved: {error}"
+                        ))
+                    })?;
+                    if !reserved.starts_with(root) {
+                        return Err(ArkError::InvalidPackage(format!(
+                            "Reserved package metadata path '{}' resolves outside the target root",
+                            reserved.display()
+                        )));
+                    }
+                    if !reserved.is_dir() {
+                        return Err(ArkError::InvalidPackage(
+                            "Reserved package metadata path is not a directory".into(),
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ArkError::Io(error)),
+            }
+        }
         if destination.starts_with(&reserved) || reserved.starts_with(destination) {
             return Err(ArkError::InvalidPackage(format!(
                 "Package file '{}' overlaps reserved database state",

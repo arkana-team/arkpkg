@@ -773,3 +773,45 @@ fn installer_rejects_database_state_through_etc_config_alias() {
         assert!(db.is_installed("existing").unwrap().is_some());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_package_metadata_alias_targets() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::create_dir_all(root.path().join("etc/arkpkg")).unwrap();
+    fs::create_dir_all(root.path().join("config/pkgmeta")).unwrap();
+    symlink(
+        "../../config/pkgmeta",
+        root.path().join("etc/arkpkg/packages"),
+    )
+    .unwrap();
+    let arkinfo = root.path().join("config/pkgmeta/existing.arkinfo");
+    fs::write(&arkinfo, b"original metadata").unwrap();
+
+    let payload = source
+        .path()
+        .join("package/config/pkgmeta/existing.arkinfo");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"replacement metadata").unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: metadataaliasattack\nDescription: reject package metadata aliases\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    let archive = output.path().join("attack.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    db.init().unwrap();
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+    assert!(matches!(
+        installer.install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert_eq!(fs::read(arkinfo).unwrap(), b"original metadata");
+}
