@@ -660,3 +660,70 @@ fn installer_rechecks_consent_and_preserves_files_created_after_preflight() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_database_state_payloads_even_with_force() {
+    use std::os::unix::fs::symlink;
+
+    for relative in [
+        "etc",
+        "etc/arkpkg",
+        "etc/arkpkg/package.db",
+        "etc/arkpkg/file.db",
+        "etc/arkpkg/packages/other.arkinfo",
+        "state-alias/package.db",
+        "state-alias/file.db",
+        "state-alias/packages/other.arkinfo",
+    ] {
+        for link_payload in [false, true] {
+            let source = TempDir::new().unwrap();
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let output = TempDir::new().unwrap();
+            let target = outside.path().join("must-not-be-created");
+            fs::write(
+                source.path().join("ARKPKG"),
+                "Name: stateattack\nDescription: reserved state test\nVersion: 1.0\nArch: any\n",
+            )
+            .unwrap();
+            let payload = source.path().join("package").join(relative);
+            fs::create_dir_all(payload.parent().unwrap()).unwrap();
+            if link_payload {
+                symlink(&target, &payload).unwrap();
+            } else {
+                fs::write(&payload, b"replacement").unwrap();
+            }
+            let archive = output.path().join("attack.ark");
+            create_ark(source.path(), &archive).unwrap();
+
+            let db = Database::new(root.path());
+            db.init().unwrap();
+            db.add_installed_package("existing", &Version::parse("1.0").unwrap())
+                .unwrap();
+            db.add_file_ownership(&[PathBuf::from("/usr/bin/existing")], "existing")
+                .unwrap();
+            let db_dir = root.path().join("etc/arkpkg");
+            let info_path = db_dir.join("packages/other.arkinfo");
+            fs::write(&info_path, b"original metadata").unwrap();
+            let package_before = fs::read(db_dir.join("package.db")).unwrap();
+            let file_before = fs::read(db_dir.join("file.db")).unwrap();
+            symlink("etc/arkpkg", root.path().join("state-alias")).unwrap();
+            let logger = Logger::new(root.path());
+            let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+            assert!(
+                matches!(
+                    installer.install(&archive),
+                    Err(ArkError::InvalidPackage(_))
+                ),
+                "accepted {relative} (symlink: {link_payload})"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read(db_dir.join("package.db")).unwrap(), package_before);
+            assert_eq!(fs::read(db_dir.join("file.db")).unwrap(), file_before);
+            assert_eq!(fs::read(&info_path).unwrap(), b"original metadata");
+            assert!(!db_dir.join("packages/stateattack.arkinfo").exists());
+        }
+    }
+}

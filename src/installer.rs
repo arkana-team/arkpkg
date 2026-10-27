@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::archive::extract_ark;
 use crate::checksum::{compute_sha256_file, compute_sha256_path};
-use crate::database::{ArkInfo, Database};
+use crate::database::{ArkInfo, Database, validate_payload_path};
 use crate::errors::{ArkError, Result};
 use crate::logger::Logger;
 use crate::prompt::PromptHandler;
@@ -207,7 +207,15 @@ impl<'a> Installer<'a> {
             }
 
             if entry.file_type().is_file() || entry.file_type().is_symlink() {
+                validate_payload_path(relative)?;
                 let destination = resolve_destination(&canonical_root, relative, false)?;
+                let resolved_relative =
+                    destination.strip_prefix(&canonical_root).map_err(|_| {
+                        ArkError::InvalidPackage(
+                            "Install destination resolves outside target root".into(),
+                        )
+                    })?;
+                validate_payload_path(resolved_relative)?;
                 if !destinations.insert(destination.clone()) {
                     return Err(ArkError::InvalidPackage(format!(
                         "Multiple package files resolve to '{}'",
@@ -259,6 +267,13 @@ impl<'a> Installer<'a> {
         for (src_path, rel_path, planned_destination) in &files_to_install {
             let prepared = (|| -> Result<_> {
                 let destination = resolve_destination(&canonical_root, rel_path, true)?;
+                let resolved_relative =
+                    destination.strip_prefix(&canonical_root).map_err(|_| {
+                        ArkError::InvalidPackage(
+                            "Install destination resolves outside target root".into(),
+                        )
+                    })?;
+                validate_payload_path(resolved_relative)?;
                 if destination != *planned_destination {
                     return Err(ArkError::InvalidPackage(format!(
                         "Install destination for '{}' changed during installation",
