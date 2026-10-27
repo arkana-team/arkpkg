@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -239,20 +240,26 @@ struct RemovalRoot {
     path: PathBuf,
     canonical_path: PathBuf,
     dir: Rc<OwnedFd>,
+    directories: RefCell<HashMap<PathBuf, Rc<OwnedFd>>>,
 }
 
 impl RemovalRoot {
     fn new(path: &Path) -> Result<Self> {
-        let dir = open(
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
+        let dir = Rc::new(
+            open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let mut directories = HashMap::new();
+        directories.insert(PathBuf::new(), Rc::clone(&dir));
         Ok(Self {
             path: path.to_path_buf(),
             canonical_path: path.canonicalize()?,
-            dir: Rc::new(dir),
+            dir,
+            directories: RefCell::new(directories),
         })
     }
 
@@ -285,6 +292,7 @@ impl RemovalRoot {
 
     fn open_dir(&self, relative: &Path) -> Result<Rc<OwnedFd>> {
         let mut dir = Rc::clone(&self.dir);
+        let mut current_path = PathBuf::new();
         // Canonicalization preserves support for in-root directory symlinks.
         // Reopen each canonical component without following links: a concurrent
         // replacement can fail resolution, but cannot escape the pinned root.
@@ -292,6 +300,11 @@ impl RemovalRoot {
             let Component::Normal(name) = part else {
                 return Err(ArkError::InvalidPackage("Unsafe removal parent".into()));
             };
+            current_path.push(name);
+            if let Some(cached) = self.directories.borrow().get(&current_path).cloned() {
+                dir = cached;
+                continue;
+            }
             dir = Rc::new(
                 openat(
                     &*dir,
@@ -301,6 +314,9 @@ impl RemovalRoot {
                 )
                 .map_err(io::Error::from)?,
             );
+            self.directories
+                .borrow_mut()
+                .insert(current_path.clone(), Rc::clone(&dir));
         }
         Ok(dir)
     }
@@ -535,6 +551,22 @@ mod tests {
             assert!(root.open_dir(relative).is_err());
             assert!(root.resolve_file(Path::new("/usr/bin/tool")).is_err());
             assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn large_file_lists_reuse_the_open_parent_directory() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let first = root
+            .resolve_file(Path::new("/usr/share/nscde/file-0"))
+            .unwrap();
+
+        for index in 1..10_000 {
+            let path = format!("/usr/share/nscde/file-{index}");
+            let file = root.resolve_file(Path::new(&path)).unwrap();
+            assert!(Rc::ptr_eq(&first.parent, &file.parent));
         }
     }
 
