@@ -11,7 +11,7 @@ use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
 use arkpkg::remover::Remover;
 use arkpkg::repository::{RepositoryManager, RepositoryPackage};
-use arkpkg::resolver::resolve_install_plan;
+use arkpkg::resolver::{resolve_install_plan, validate_install_plan};
 use arkpkg::verifier::Verifier;
 
 fn run() -> Result<()> {
@@ -49,6 +49,7 @@ fn run() -> Result<()> {
                         return Err(arkpkg::errors::ArkError::UserCancelled);
                     }
                 }
+                validate_install_plan(&plan)?;
                 let mut installer = Installer::new(&db, &logger, prompt);
                 for resolved in plan {
                     installer.install(resolved.archive.path())?;
