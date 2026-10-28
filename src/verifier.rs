@@ -77,6 +77,7 @@ impl<'a> Verifier<'a> {
                                 file_rel.display()
                             );
                             results.push(VerifyStatus::Unverified(file_rel.clone()));
+                            failed = true;
                         } else if actual.eq_ignore_ascii_case(expected) {
                             println!("OK      {}", file_rel.display());
                             results.push(VerifyStatus::Ok(file_rel.clone()));

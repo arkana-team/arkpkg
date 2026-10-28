@@ -1071,14 +1071,15 @@ fn installer_rejects_package_metadata_alias_targets() {
 #[cfg(unix)]
 #[test]
 fn verifier_does_not_certify_legacy_object_types() {
-    use arkpkg::checksum::compute_sha256_bytes;
+    use arkpkg::checksum::{compute_sha256_bytes, compute_sha256_path};
     use arkpkg::database::ArkInfo;
-    use arkpkg::verifier::VerifyStatus;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
 
     let root = TempDir::new().unwrap();
     let db = Database::new(root.path());
     let installed = root.path().join("tool");
+    fs::write(root.path().join("target"), b"different reader content").unwrap();
     let base = "Name: legacy\nVersion: 1.0\nFiles:\n/tool\n";
     for hashes in [
         String::new(),
@@ -1088,26 +1089,40 @@ fn verifier_does_not_certify_legacy_object_types() {
             .unwrap();
         fs::write(&installed, b"target").unwrap();
         let verifier = Verifier::new(&db);
-        let result = verifier.verify("legacy");
-        if hashes.is_empty() {
-            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
-        } else {
+        let metadata_path = root.path().join("etc/arkpkg/packages/legacy.arkinfo");
+        let metadata_before = fs::read(&metadata_path).unwrap();
+        let assert_unverified = || {
             assert!(matches!(
-                result.unwrap().as_slice(),
-                [VerifyStatus::Unverified(_)]
+                verifier.verify("legacy"),
+                Err(ArkError::VerificationFailed(_))
             ));
-        }
+            let output = Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+                .arg("--root")
+                .arg(root.path())
+                .args(["verify", "legacy"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(5));
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("UNVERIFIED /tool")
+            );
+            assert!(
+                String::from_utf8(output.stderr)
+                    .unwrap()
+                    .contains("Verification failed")
+            );
+            assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
+        };
+        assert_unverified();
+        let original_hash = compute_sha256_path(&installed).unwrap();
+        let original_content = fs::read(&installed).unwrap();
         fs::remove_file(&installed).unwrap();
         symlink("target", &installed).unwrap();
-        let result = verifier.verify("legacy");
-        if hashes.is_empty() {
-            assert!(matches!(result, Err(ArkError::VerificationFailed(_))));
-        } else {
-            assert!(matches!(
-                result.unwrap().as_slice(),
-                [VerifyStatus::Unverified(_)]
-            ));
-        }
+        assert_eq!(compute_sha256_path(&installed).unwrap(), original_hash);
+        assert_ne!(fs::read(&installed).unwrap(), original_content);
+        assert_unverified();
         fs::remove_file(&installed).unwrap();
         if !hashes.is_empty() {
             fs::write(&installed, b"changed").unwrap();
