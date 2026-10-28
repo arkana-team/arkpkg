@@ -79,13 +79,27 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn format_build_error(err: &ArkError) -> String {
+    let message = format!("Build failed: {err}");
+    let mut escaped = String::with_capacity(message.len());
+    // Rejected metadata and paths can still contain terminal controls.
+    for ch in message.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("Unexpected internal error: {}", info);
     }));
 
     if let Err(err) = run() {
-        eprintln!("Build failed: {}", err);
+        eprintln!("{}", format_build_error(&err));
         process::exit(err.exit_code());
     }
 }
