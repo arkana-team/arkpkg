@@ -166,7 +166,6 @@ impl<'a> Remover<'a> {
         self.logger.info("Updating file.db");
         if let Err(error) = self.db.remove_file_ownership(&arkinfo.files) {
             self.restore_database_and_files(
-                pkg_name,
                 &arkinfo,
                 &root,
                 &removed_files,
@@ -180,7 +179,6 @@ impl<'a> Remover<'a> {
         self.logger.info("Deleting .arkinfo metadata file");
         if let Err(error) = self.db.remove_arkinfo(pkg_name) {
             self.restore_database_and_files(
-                pkg_name,
                 &arkinfo,
                 &root,
                 &removed_files,
@@ -222,7 +220,6 @@ impl<'a> Remover<'a> {
 
     fn restore_database_and_files(
         &self,
-        pkg_name: &str,
         arkinfo: &crate::database::ArkInfo,
         root: &RemovalRoot,
         removed_files: &[FileChange],
@@ -232,14 +229,14 @@ impl<'a> Remover<'a> {
     ) -> Result<()> {
         if restore_ownership {
             self.db
-                .add_file_ownership(&arkinfo.files, pkg_name)
+                .add_file_ownership(&arkinfo.files, &arkinfo.name)
                 .map_err(|error| {
                     ArkError::Generic(format!("Failed to restore file ownership: {error}"))
                 })?;
         }
         if restore_package {
             self.db
-                .add_installed_package(pkg_name, &arkinfo.version)
+                .add_installed_package(&arkinfo.name, &arkinfo.version)
                 .map_err(|error| {
                     ArkError::Generic(format!("Failed to restore package record: {error}"))
                 })?;

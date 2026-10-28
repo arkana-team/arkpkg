@@ -440,10 +440,9 @@ impl<'a> Installer<'a> {
         for change in &file_changes {
             if let Some(backup) = &change.backup
                 && !preserved_backup_paths.contains(&change.relative.with_file_name(backup))
+                && let Ok(parent) = change.open_parent(&install_root, &mut destination_parents)
             {
-                if let Ok(parent) = change.open_parent(&install_root, &mut destination_parents) {
-                    let _ = parent.remove_file(backup);
-                }
+                let _ = parent.remove_file(backup);
             }
         }
         crate::linker_cache::refresh_if_needed(self.db.root(), &installed_rel_files, self.logger);
