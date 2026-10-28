@@ -1,4 +1,6 @@
 use cap_std::ambient_authority;
+#[cfg(unix)]
+use cap_std::fs::MetadataExt;
 use cap_std::fs::{Dir, OpenOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -268,7 +270,7 @@ impl<'a> Installer<'a> {
         self.logger.info("Copying files into installation root");
         let pkg_checksum = compute_sha256_file(ark_path)?;
         let install_root = Dir::open_ambient_dir(&canonical_root, ambient_authority())?;
-        let mut destination_parents: HashMap<PathBuf, Rc<Dir>> = HashMap::new();
+        let mut destination_parents = ParentDirectoryCache::default();
         let mut file_changes: Vec<FileChange> = Vec::new();
         let mut installed_rel_files = Vec::new();
         let mut file_hashes = Vec::new();
@@ -314,7 +316,7 @@ impl<'a> Installer<'a> {
             let (dest_path, install_rel_path, untracked) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    self.rollback(&file_changes);
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
                     return Err(error);
                 }
             };
@@ -322,7 +324,7 @@ impl<'a> Installer<'a> {
             let relative_destination = match dest_path.strip_prefix(&canonical_root) {
                 Ok(path) => path,
                 Err(error) => {
-                    self.rollback(&file_changes);
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
                     return Err(ArkError::Generic(format!(
                         "Could not resolve install destination relative to target root: {error}"
                     )));
@@ -331,27 +333,21 @@ impl<'a> Installer<'a> {
             let relative_parent = match relative_destination.parent() {
                 Some(parent) => parent,
                 None => {
-                    self.rollback(&file_changes);
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
                     return Err(ArkError::InvalidPackage(
                         "Install destination has no parent directory".into(),
                     ));
                 }
             };
-            let parent = match destination_parents.entry(relative_parent.to_path_buf()) {
-                std::collections::hash_map::Entry::Occupied(entry) => Rc::clone(entry.get()),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let parent = match create_destination_parent(
-                        &install_root,
-                        &canonical_root,
-                        relative_parent,
-                    ) {
-                        Ok(parent) => Rc::new(parent),
-                        Err(error) => {
-                            self.rollback(&file_changes);
-                            return Err(error);
-                        }
-                    };
-                    Rc::clone(entry.insert(parent))
+            let (parent, parent_identity) = match destination_parents.open_or_create(
+                &install_root,
+                &canonical_root,
+                relative_parent,
+            ) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
+                    return Err(error);
                 }
             };
             let name = PathBuf::from(relative_destination.file_name().unwrap());
@@ -359,12 +355,13 @@ impl<'a> Installer<'a> {
             let backup = match backup_existing_file(&parent, &name, temp_dir.path()) {
                 Ok(backup) => backup,
                 Err(error) => {
-                    self.rollback(&file_changes);
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
                     return Err(error);
                 }
             };
             file_changes.push(FileChange {
-                parent: Rc::clone(&parent),
+                parent_path: relative_parent.to_path_buf(),
+                parent_identity,
                 name: name.clone(),
                 relative: install_rel_path.clone(),
                 backup: backup.clone(),
@@ -383,7 +380,7 @@ impl<'a> Installer<'a> {
             {
                 Ok(hash) => hash,
                 Err(error) => {
-                    self.rollback(&file_changes);
+                    self.rollback(&file_changes, &install_root, &mut destination_parents);
                     return Err(error);
                 }
             };
@@ -408,7 +405,7 @@ impl<'a> Installer<'a> {
         };
 
         if let Err(error) = self.db.write_arkinfo(&arkinfo) {
-            self.rollback(&file_changes);
+            self.rollback(&file_changes, &install_root, &mut destination_parents);
             return Err(error);
         }
 
@@ -418,7 +415,7 @@ impl<'a> Installer<'a> {
             .db
             .add_installed_package(&metadata.name, &metadata.version)
         {
-            self.rollback(&file_changes);
+            self.rollback(&file_changes, &install_root, &mut destination_parents);
             let _ = self.db.remove_arkinfo(&metadata.name);
             return Err(error);
         }
@@ -430,7 +427,7 @@ impl<'a> Installer<'a> {
             &installed_rel_files,
             &metadata.name,
         ) {
-            self.rollback(&file_changes);
+            self.rollback(&file_changes, &install_root, &mut destination_parents);
             let _ = self.db.remove_arkinfo(&metadata.name);
             let _ = self.db.remove_installed_package(&metadata.name);
             return Err(error);
@@ -444,7 +441,9 @@ impl<'a> Installer<'a> {
             if let Some(backup) = &change.backup
                 && !preserved_backup_paths.contains(&change.relative.with_file_name(backup))
             {
-                let _ = change.parent.remove_file(backup);
+                if let Ok(parent) = change.open_parent(&install_root, &mut destination_parents) {
+                    let _ = parent.remove_file(backup);
+                }
             }
         }
         crate::linker_cache::refresh_if_needed(self.db.root(), &installed_rel_files, self.logger);
@@ -453,26 +452,126 @@ impl<'a> Installer<'a> {
     }
 
     /// Restore pre-existing files and remove files from a failed installation.
-    fn rollback(&self, file_changes: &[FileChange]) {
+    fn rollback(
+        &self,
+        file_changes: &[FileChange],
+        root: &Dir,
+        parent_cache: &mut ParentDirectoryCache,
+    ) {
         for change in file_changes.iter().rev() {
-            change.rollback();
+            if let Err(error) = change.rollback(root, parent_cache) {
+                self.logger.info(&format!(
+                    "Rollback could not restore '{}': {error}",
+                    change.relative.display()
+                ));
+            }
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn directory_identity(dir: &Dir) -> Result<DirectoryIdentity> {
+    let metadata = dir.dir_metadata()?;
+    #[cfg(unix)]
+    {
+        Ok(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(ArkError::Generic(
+            "Directory identity checks require a Unix host".into(),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct ParentDirectoryCache {
+    last: Option<(PathBuf, Rc<Dir>, DirectoryIdentity)>,
+}
+
+impl ParentDirectoryCache {
+    fn open_or_create(
+        &mut self,
+        root: &Dir,
+        canonical_root: &Path,
+        relative: &Path,
+    ) -> Result<(Rc<Dir>, DirectoryIdentity)> {
+        if let Some((path, dir, identity)) = &self.last
+            && path == relative
+        {
+            return Ok((Rc::clone(dir), *identity));
+        }
+        let dir = Rc::new(create_destination_parent(root, canonical_root, relative)?);
+        let identity = directory_identity(&dir)?;
+        self.last = Some((relative.to_path_buf(), Rc::clone(&dir), identity));
+        Ok((dir, identity))
+    }
+
+    fn open_matching(
+        &mut self,
+        root: &Dir,
+        relative: &Path,
+        expected: DirectoryIdentity,
+    ) -> Result<Rc<Dir>> {
+        if let Some((path, dir, identity)) = &self.last
+            && path == relative
+        {
+            if *identity != expected {
+                return Err(ArkError::InvalidPackage(
+                    "Install parent changed during transaction".into(),
+                ));
+            }
+            return Ok(Rc::clone(dir));
+        }
+        let dir = Rc::new(if relative.as_os_str().is_empty() {
+            root.try_clone()?
+        } else {
+            root.open_dir(relative)?
+        });
+        let identity = directory_identity(&dir)?;
+        if identity != expected {
+            return Err(ArkError::InvalidPackage(
+                "Install parent changed during transaction".into(),
+            ));
+        }
+        self.last = Some((relative.to_path_buf(), Rc::clone(&dir), identity));
+        Ok(dir)
+    }
+}
+
 struct FileChange {
-    parent: Rc<Dir>,
+    parent_path: PathBuf,
+    parent_identity: DirectoryIdentity,
     name: PathBuf,
     relative: PathBuf,
     backup: Option<PathBuf>,
 }
 
 impl FileChange {
-    fn rollback(&self) {
-        let _ = self.parent.remove_file(&self.name);
-        if let Some(backup) = &self.backup {
-            let _ = self.parent.rename(backup, &self.parent, &self.name);
+    fn open_parent(&self, root: &Dir, parent_cache: &mut ParentDirectoryCache) -> Result<Rc<Dir>> {
+        parent_cache.open_matching(root, &self.parent_path, self.parent_identity)
+    }
+
+    fn rollback(&self, root: &Dir, parent_cache: &mut ParentDirectoryCache) -> Result<()> {
+        let parent = self.open_parent(root, parent_cache)?;
+        match parent.remove_file(&self.name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ArkError::Io(error)),
         }
+        if let Some(backup) = &self.backup {
+            parent.rename(backup, &parent, &self.name)?;
+        }
+        Ok(())
     }
 }
 
@@ -794,8 +893,10 @@ mod tests {
 
         let canonical_root = root.path().canonicalize().unwrap();
         let opened_root = Dir::open_ambient_dir(&canonical_root, ambient_authority()).unwrap();
-        let parent =
-            create_destination_parent(&opened_root, &canonical_root, Path::new("usr/bin")).unwrap();
+        let mut parent_cache = ParentDirectoryCache::default();
+        let (parent, parent_identity) = parent_cache
+            .open_or_create(&opened_root, &canonical_root, Path::new("usr/bin"))
+            .unwrap();
 
         fs::rename(root.path().join("usr"), root.path().join("original-usr")).unwrap();
         symlink(outside.path(), root.path().join("usr")).unwrap();
@@ -820,12 +921,14 @@ mod tests {
         );
 
         FileChange {
-            parent: Rc::new(parent),
+            parent_path: PathBuf::from("usr/bin"),
+            parent_identity,
             name,
             relative: PathBuf::from("/usr/bin/tool"),
             backup,
         }
-        .rollback();
+        .rollback(&opened_root, &mut parent_cache)
+        .unwrap();
 
         assert_eq!(fs::read(installed).unwrap(), b"original");
         assert_eq!(
@@ -874,5 +977,51 @@ mod tests {
             fs::read_link(root.path().join("tool")).unwrap(),
             Path::new("/usr/lib/tool")
         );
+    }
+
+    #[test]
+    fn install_and_remove_support_more_parent_directories_than_the_fd_limit() {
+        const DIRECTORY_COUNT: usize = 1_100;
+        let root = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let package_root = source.path().join("package/usr/share/fd-limit");
+        fs::create_dir_all(&package_root).unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: fd-limit-integration\nDescription: exercise bounded parent handles\nVersion: 1.0.0\nArch: any\n",
+        )
+        .unwrap();
+        for index in 0..DIRECTORY_COUNT {
+            let directory = package_root.join(format!("d{index:04}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("payload"), b"fd-limit-test").unwrap();
+        }
+        let archive = source.path().join("fd-limit-integration.ark");
+        crate::archive::create_ark(source.path(), &archive).unwrap();
+
+        let database = Database::new(root.path());
+        database.init().unwrap();
+        let logger = Logger::new(root.path());
+        logger.init().unwrap();
+        Installer::new(&database, &logger, PromptHandler::new(true, false, false))
+            .install(&archive)
+            .unwrap();
+        assert!(
+            database
+                .is_installed("fd-limit-integration")
+                .unwrap()
+                .is_some()
+        );
+
+        crate::remover::Remover::new(&database, &logger, PromptHandler::new(true, false, false))
+            .remove("fd-limit-integration")
+            .unwrap();
+        assert!(
+            database
+                .is_installed("fd-limit-integration")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.path().join("usr/share/fd-limit").exists());
     }
 }
