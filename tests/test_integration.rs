@@ -13,6 +13,54 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
+fn info_escapes_persisted_provides_without_changing_metadata() {
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    let provide_path = "/usr/bin/café\x1b[2J\x1b[H\rforged\t\x08\x1b]0;title\x07\u{9b}2J";
+    fs::write(
+        source.path().join("ARKPKG"),
+        format!(
+            "Name: infoguard\nDescription: info test\nVersion: 1.0\nArch: any\nProvides:\ninfoguard={provide_path}\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir(source.path().join("package")).unwrap();
+    let archive = output.path().join("infoguard.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+    Installer::new(&db, &logger, PromptHandler::new(true, false, false))
+        .install(&archive)
+        .unwrap();
+
+    let metadata_path = root.path().join("etc/arkpkg/packages/infoguard.arkinfo");
+    let persisted = fs::read_to_string(&metadata_path).unwrap();
+    assert!(persisted.contains(provide_path));
+    assert_eq!(
+        db.read_arkinfo("infoguard").unwrap().provides[0].path,
+        provide_path
+    );
+
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_arkpkg"))
+        .arg("--root")
+        .arg(root.path())
+        .args(["info", "infoguard"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(!stdout.chars().any(|ch| ch.is_control() && ch != '\n'));
+    assert!(stdout.contains(concat!(
+        "Provides:\n",
+        "infoguard=/usr/bin/café\\u{1b}[2J\\u{1b}[H\\rforged\\t\\u{8}",
+        "\\u{1b}]0;title\\u{7}\\u{9b}2J\n"
+    )));
+    assert_eq!(fs::read_to_string(metadata_path).unwrap(), persisted);
+}
+
+#[test]
 fn installer_escapes_archive_path_in_logs() {
     let source = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
