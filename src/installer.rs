@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -510,30 +510,15 @@ fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> 
         "etc/arkpkg/file.db",
         "etc/arkpkg/packages",
     ] {
-        let mut reserved = resolve_destination(root, Path::new(relative), false)?;
-        if relative == "etc/arkpkg/packages" {
-            match fs::symlink_metadata(&reserved) {
-                Ok(_) => {
-                    reserved = reserved.canonicalize().map_err(|error| {
-                        ArkError::InvalidPackage(format!(
-                            "Reserved package metadata path cannot be resolved: {error}"
-                        ))
-                    })?;
-                    if !reserved.starts_with(root) {
-                        return Err(ArkError::InvalidPackage(format!(
-                            "Reserved package metadata path '{}' resolves outside the target root",
-                            reserved.display()
-                        )));
-                    }
-                    if !reserved.is_dir() {
-                        return Err(ArkError::InvalidPackage(
-                            "Reserved package metadata path is not a directory".into(),
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ArkError::Io(error)),
-            }
+        let relative = Path::new(relative);
+        let directory = if relative == Path::new("etc/arkpkg/packages") {
+            relative
+        } else {
+            relative.parent().unwrap()
+        };
+        let mut reserved = resolve_database_directory(root, directory, destination)?;
+        if directory != relative {
+            reserved.push(relative.file_name().unwrap());
         }
         if destination.starts_with(&reserved) || reserved.starts_with(destination) {
             return Err(ArkError::InvalidPackage(format!(
@@ -543,6 +528,57 @@ fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// Inspect every component before following it: canonicalization alone hides
+/// intermediate aliases that payload files could replace to redirect later DB IO.
+fn resolve_database_directory(root: &Path, relative: &Path, destination: &Path) -> Result<PathBuf> {
+    let mut pending: VecDeque<_> = relative
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let mut current = root.to_path_buf();
+    let mut symlinks = 0;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next().unwrap() {
+            Component::CurDir => continue,
+            Component::ParentDir if current != root => {
+                current.pop();
+                continue;
+            }
+            Component::Normal(name) => current.push(name),
+            _ => {
+                return Err(ArkError::InvalidPackage(
+                    "Reserved database directory resolves outside the target root".into(),
+                ));
+            }
+        }
+        if current.starts_with(destination) {
+            return Err(ArkError::InvalidPackage(format!(
+                "Package file '{}' overlaps reserved database state",
+                destination.display()
+            )));
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            symlinks += 1;
+            if symlinks > 40 {
+                return Err(ArkError::InvalidPackage(
+                    "Too many symlinks in reserved database directory".into(),
+                ));
+            }
+            let target = fs::read_link(&current)?;
+            for component in target.components().rev() {
+                pending.push_front(component.as_os_str().to_os_string());
+            }
+            current.pop();
+        } else if !metadata.is_dir() {
+            return Err(ArkError::InvalidPackage(
+                "Reserved database path is not a directory".into(),
+            ));
+        }
+    }
+    Ok(current)
 }
 
 /// Returns whether overwriting this destination requires consent and preservation.
