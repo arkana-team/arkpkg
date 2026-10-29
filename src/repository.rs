@@ -505,7 +505,7 @@ fn validate_package(package: &RepositoryPackage) -> Result<()> {
         || !package
             .file
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-/".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-/~:".contains(&byte))
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -864,6 +864,16 @@ mod tests {
         let mut invalid_hash = package("packages/hello.ark");
         invalid_hash.sha256 = "xyz".into();
         assert!(validate_package(&invalid_hash).is_err());
+    }
+
+    #[test]
+    fn accepts_debian_version_separators_in_archive_paths() {
+        for path in [
+            "packages/asciijump-1.0.2~beta-11-x86_64.ark",
+            "packages/crawl-2:0.28.0-1.1-x86_64.ark",
+        ] {
+            assert!(validate_package(&package(path)).is_ok(), "rejected {path}");
+        }
     }
 
     #[test]

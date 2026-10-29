@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
@@ -5,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, renameat, statat, unlinkat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, fstat, open, openat, renameat, statat, unlinkat,
+};
 
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
@@ -94,11 +97,13 @@ impl<'a> Remover<'a> {
         for file_rel in &arkinfo.files {
             // Reuse the preserved file's handle so staging and restoration cannot
             // be redirected to different directories by an ancestor replacement.
-            let file = preserved_files
+            let file = match preserved_files
                 .iter()
                 .find(|(original, _)| original == file_rel)
-                .map(|(_, change)| Ok(change.file.clone()))
-                .unwrap_or_else(|| root.resolve_file(file_rel));
+            {
+                Some((_, change)) => change.resolve_file(&root),
+                None => root.resolve_file(file_rel),
+            };
             let staged = match file {
                 Ok(file) => backup_installed_file(file),
                 Err(ArkError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -115,7 +120,7 @@ impl<'a> Remover<'a> {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    restore_removed_files(&removed_files)?;
+                    restore_removed_files(&root, &removed_files)?;
                     return Err(error);
                 }
             }
@@ -123,9 +128,16 @@ impl<'a> Remover<'a> {
 
         let mut restored_preserved_files = Vec::new();
         for (original, change) in &preserved_files {
-            match change.file.metadata() {
+            let file = match change.resolve_file(&root) {
+                Ok(file) => file,
+                Err(error) => {
+                    rollback_files(&root, &restored_preserved_files, &removed_files)?;
+                    return Err(error);
+                }
+            };
+            match file.metadata() {
                 Ok(_) => {
-                    rollback_files(&restored_preserved_files, &removed_files)?;
+                    rollback_files(&root, &restored_preserved_files, &removed_files)?;
                     return Err(ArkError::PackageConflict(format!(
                         "Cannot restore pre-install file '{}' because the path is occupied",
                         original.display()
@@ -133,12 +145,12 @@ impl<'a> Remover<'a> {
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    rollback_files(&restored_preserved_files, &removed_files)?;
+                    rollback_files(&root, &restored_preserved_files, &removed_files)?;
                     return Err(ArkError::Io(error));
                 }
             }
-            if let Err(error) = change.restore() {
-                rollback_files(&restored_preserved_files, &removed_files)?;
+            if let Err(error) = change.restore(&root) {
+                rollback_files(&root, &restored_preserved_files, &removed_files)?;
                 return Err(error);
             }
             restored_preserved_files.push(change.clone());
@@ -147,15 +159,15 @@ impl<'a> Remover<'a> {
         // Remove database records only after all package files have been staged for deletion.
         self.logger.info("Updating package.db");
         if let Err(error) = self.db.remove_installed_package(pkg_name) {
-            rollback_files(&restored_preserved_files, &removed_files)?;
+            rollback_files(&root, &restored_preserved_files, &removed_files)?;
             return Err(error);
         }
 
         self.logger.info("Updating file.db");
         if let Err(error) = self.db.remove_file_ownership(&arkinfo.files) {
             self.restore_database_and_files(
-                pkg_name,
                 &arkinfo,
+                &root,
                 &removed_files,
                 &restored_preserved_files,
                 true,
@@ -167,8 +179,8 @@ impl<'a> Remover<'a> {
         self.logger.info("Deleting .arkinfo metadata file");
         if let Err(error) = self.db.remove_arkinfo(pkg_name) {
             self.restore_database_and_files(
-                pkg_name,
                 &arkinfo,
+                &root,
                 &removed_files,
                 &restored_preserved_files,
                 true,
@@ -178,7 +190,7 @@ impl<'a> Remover<'a> {
         }
 
         for change in &removed_files {
-            let _ = change.delete_backup();
+            let _ = change.delete_backup(&root);
         }
 
         // unlinkat checks emptiness atomically and never follows the final entry.
@@ -208,8 +220,8 @@ impl<'a> Remover<'a> {
 
     fn restore_database_and_files(
         &self,
-        pkg_name: &str,
         arkinfo: &crate::database::ArkInfo,
+        root: &RemovalRoot,
         removed_files: &[FileChange],
         restored_preserved_files: &[FileChange],
         restore_package: bool,
@@ -217,42 +229,61 @@ impl<'a> Remover<'a> {
     ) -> Result<()> {
         if restore_ownership {
             self.db
-                .add_file_ownership(&arkinfo.files, pkg_name)
+                .add_file_ownership(&arkinfo.files, &arkinfo.name)
                 .map_err(|error| {
                     ArkError::Generic(format!("Failed to restore file ownership: {error}"))
                 })?;
         }
         if restore_package {
             self.db
-                .add_installed_package(pkg_name, &arkinfo.version)
+                .add_installed_package(&arkinfo.name, &arkinfo.version)
                 .map_err(|error| {
                     ArkError::Generic(format!("Failed to restore package record: {error}"))
                 })?;
         }
-        rollback_files(restored_preserved_files, removed_files)
+        rollback_files(root, restored_preserved_files, removed_files)
     }
 }
 
-// Pathnames are used only to resolve and check a parent. Every mutation then
-// uses a retained directory descriptor and a single filename.
+// Keep only the root and most recently resolved parent descriptors open. File
+// changes retain a relative path and directory identity, then reopen through
+// the pinned root when rollback or cleanup needs the parent again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn directory_identity(dir: &OwnedFd) -> Result<DirectoryIdentity> {
+    let metadata = fstat(dir).map_err(io::Error::from)?;
+    Ok(DirectoryIdentity {
+        device: metadata.st_dev as u64,
+        inode: metadata.st_ino as u64,
+    })
+}
+
 struct RemovalRoot {
     path: PathBuf,
     canonical_path: PathBuf,
     dir: Rc<OwnedFd>,
+    directory: RefCell<Option<(PathBuf, Rc<OwnedFd>, DirectoryIdentity)>>,
 }
 
 impl RemovalRoot {
     fn new(path: &Path) -> Result<Self> {
-        let dir = open(
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
+        let dir = Rc::new(
+            open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
         Ok(Self {
             path: path.to_path_buf(),
             canonical_path: path.canonicalize()?,
-            dir: Rc::new(dir),
+            dir,
+            directory: RefCell::new(None),
         })
     }
 
@@ -277,13 +308,22 @@ impl RemovalRoot {
                 path.display()
             ))
         })?;
+        let (parent, parent_identity) = self.open_dir(relative_parent)?;
         Ok(ResolvedFile {
-            parent: self.open_dir(relative_parent)?,
+            parent,
+            parent_path: relative_parent.to_path_buf(),
+            parent_identity,
             name: relative.file_name().unwrap().to_os_string(),
         })
     }
 
-    fn open_dir(&self, relative: &Path) -> Result<Rc<OwnedFd>> {
+    fn open_dir(&self, relative: &Path) -> Result<(Rc<OwnedFd>, DirectoryIdentity)> {
+        if let Some((cached_path, cached_dir, cached_identity)) = self.directory.borrow().as_ref()
+            && cached_path == relative
+        {
+            return Ok((Rc::clone(cached_dir), *cached_identity));
+        }
+
         let mut dir = Rc::clone(&self.dir);
         // Canonicalization preserves support for in-root directory symlinks.
         // Reopen each canonical component without following links: a concurrent
@@ -302,6 +342,22 @@ impl RemovalRoot {
                 .map_err(io::Error::from)?,
             );
         }
+        let identity = directory_identity(&dir)?;
+        *self.directory.borrow_mut() = Some((relative.to_path_buf(), Rc::clone(&dir), identity));
+        Ok((dir, identity))
+    }
+
+    fn open_dir_matching(
+        &self,
+        relative: &Path,
+        expected: DirectoryIdentity,
+    ) -> Result<Rc<OwnedFd>> {
+        let (dir, actual) = self.open_dir(relative)?;
+        if actual != expected {
+            return Err(ArkError::InvalidPackage(
+                "Removal parent changed during transaction".into(),
+            ));
+        }
         Ok(dir)
     }
 }
@@ -309,6 +365,8 @@ impl RemovalRoot {
 #[derive(Clone)]
 struct ResolvedFile {
     parent: Rc<OwnedFd>,
+    parent_path: PathBuf,
+    parent_identity: DirectoryIdentity,
     name: OsString,
 }
 
@@ -331,18 +389,34 @@ impl ResolvedFile {
 
 #[derive(Clone)]
 struct FileChange {
-    file: ResolvedFile,
+    parent_path: PathBuf,
+    parent_identity: DirectoryIdentity,
+    name: OsString,
     backup: OsString,
 }
 
 impl FileChange {
-    fn restore(&self) -> Result<()> {
-        self.file.rename(&self.backup, &self.file.name)
+    fn resolve_file(&self, root: &RemovalRoot) -> Result<ResolvedFile> {
+        Ok(ResolvedFile {
+            parent: root.open_dir_matching(&self.parent_path, self.parent_identity)?,
+            parent_path: self.parent_path.clone(),
+            parent_identity: self.parent_identity,
+            name: self.name.clone(),
+        })
     }
 
-    fn delete_backup(&self) -> io::Result<()> {
-        unlinkat(&*self.file.parent, &self.backup, AtFlags::empty())?;
+    fn restore(&self, root: &RemovalRoot) -> Result<()> {
+        self.resolve_file(root)?.rename(&self.backup, &self.name)
+    }
+
+    fn delete_backup(&self, root: &RemovalRoot) -> Result<()> {
+        let file = self.resolve_file(root)?;
+        unlinkat(&*file.parent, &self.backup, AtFlags::empty()).map_err(io::Error::from)?;
         Ok(())
+    }
+
+    fn move_current_to_backup(&self, root: &RemovalRoot) -> Result<()> {
+        self.resolve_file(root)?.rename(&self.name, &self.backup)
     }
 }
 
@@ -372,7 +446,9 @@ fn resolve_preserved_files(
         resolved.push((
             original.clone(),
             FileChange {
-                file,
+                parent_path: file.parent_path,
+                parent_identity: file.parent_identity,
+                name: file.name,
                 backup: backup_name,
             },
         ));
@@ -381,13 +457,14 @@ fn resolve_preserved_files(
 }
 
 fn rollback_files(
+    root: &RemovalRoot,
     restored_preserved_files: &[FileChange],
     removed_files: &[FileChange],
 ) -> Result<()> {
     for change in restored_preserved_files.iter().rev() {
-        change.file.rename(&change.file.name, &change.backup)?;
+        change.move_current_to_backup(root)?;
     }
-    restore_removed_files(removed_files)
+    restore_removed_files(root, removed_files)
 }
 
 fn backup_installed_file(file: ResolvedFile) -> Result<Option<FileChange>> {
@@ -416,20 +493,24 @@ fn backup_installed_file(file: ResolvedFile) -> Result<Option<FileChange>> {
             )
             .map_err(io::Error::from)
         })?;
-    let change = FileChange {
-        file,
-        backup: temporary.path().file_name().unwrap().to_os_string(),
-    };
-    if let Err(error) = change.file.rename(&change.file.name, &change.backup) {
-        let _ = change.delete_backup();
-        return Err(error);
+    let backup = temporary.path().file_name().unwrap().to_os_string();
+    if let Err(error) =
+        renameat(&*file.parent, &file.name, &*file.parent, &backup).map_err(io::Error::from)
+    {
+        let _ = unlinkat(&*file.parent, &backup, AtFlags::empty());
+        return Err(ArkError::Io(error));
     }
-    Ok(Some(change))
+    Ok(Some(FileChange {
+        parent_path: file.parent_path,
+        parent_identity: file.parent_identity,
+        name: file.name,
+        backup,
+    }))
 }
 
-fn restore_removed_files(removed_files: &[FileChange]) -> Result<()> {
+fn restore_removed_files(root: &RemovalRoot, removed_files: &[FileChange]) -> Result<()> {
     for change in removed_files.iter().rev() {
-        change.restore()?;
+        change.restore(root)?;
     }
     Ok(())
 }
@@ -440,6 +521,16 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    fn open_parent_descriptors(base: &Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|path| path.starts_with(base))
+            .count()
+    }
 
     #[test]
     fn staging_and_cleanup_stay_in_the_opened_parent_after_ancestor_replacement() {
@@ -469,7 +560,7 @@ mod tests {
         // A pathname-based cleanup would delete this external sentinel.
         let sentinel = outside.path().join("bin").join(&change.backup);
         fs::write(&sentinel, b"external backup").unwrap();
-        change.delete_backup().unwrap();
+        change.delete_backup(&root).unwrap();
         assert_eq!(fs::read(sentinel).unwrap(), b"external backup");
         assert_eq!(
             fs::read_dir(target.path().join("moved/bin"))
@@ -493,21 +584,20 @@ mod tests {
         let root = RemovalRoot::new(target.path()).unwrap();
         let preserved = resolve_preserved_files(&root, &info).unwrap();
         let original = &preserved[0].1;
-        let removed = backup_installed_file(original.file.clone())
-            .unwrap()
-            .unwrap();
+        let original_file = original.resolve_file(&root).unwrap();
+        let removed = backup_installed_file(original_file).unwrap().unwrap();
 
         fs::rename(target.path().join("usr"), target.path().join("moved")).unwrap();
         symlink(outside.path(), target.path().join("usr")).unwrap();
-        for name in [&original.file.name, &original.backup, &removed.backup] {
+        for name in [&original.name, &original.backup, &removed.backup] {
             fs::write(outside.path().join("bin").join(name), b"outside").unwrap();
         }
-        original.restore().unwrap();
+        original.restore(&root).unwrap();
         assert_eq!(
             fs::read(target.path().join("moved/bin/tool")).unwrap(),
             b"base"
         );
-        rollback_files(std::slice::from_ref(original), &[removed]).unwrap();
+        rollback_files(&root, std::slice::from_ref(original), &[removed]).unwrap();
         assert_eq!(
             fs::read(target.path().join("moved/bin/tool")).unwrap(),
             b"package"
@@ -536,6 +626,59 @@ mod tests {
             assert!(root.resolve_file(Path::new("/usr/bin/tool")).is_err());
             assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn large_file_lists_reuse_the_open_parent_directory() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let first = root
+            .resolve_file(Path::new("/usr/share/nscde/file-0"))
+            .unwrap();
+
+        for index in 1..10_000 {
+            let path = format!("/usr/share/nscde/file-{index}");
+            let file = root.resolve_file(Path::new(&path)).unwrap();
+            assert!(Rc::ptr_eq(&first.parent, &file.parent));
+        }
+    }
+
+    #[test]
+    fn removal_keeps_file_descriptors_bounded_across_many_parent_directories() {
+        const DIRECTORY_COUNT: usize = 1_200;
+        let target = TempDir::new().unwrap();
+        let base = target.path().join("usr/share/fd-limit");
+        fs::create_dir_all(&base).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(open_parent_descriptors(&base), 0);
+        let mut changes = Vec::with_capacity(DIRECTORY_COUNT);
+
+        for index in 0..DIRECTORY_COUNT {
+            let directory = base.join(format!("d{index:04}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("payload"), b"package").unwrap();
+            let relative = format!("/usr/share/fd-limit/d{index:04}/payload");
+            let file = root.resolve_file(Path::new(&relative)).unwrap();
+            changes.push(backup_installed_file(file).unwrap().unwrap());
+        }
+
+        assert_eq!(changes.len(), DIRECTORY_COUNT);
+        #[cfg(target_os = "linux")]
+        assert!(
+            open_parent_descriptors(&base) <= 1,
+            "staging many removals must retain at most one parent descriptor"
+        );
+        for change in &changes {
+            change.delete_backup(&root).unwrap();
+        }
+        assert!(fs::read_dir(base).unwrap().all(|entry| {
+            fs::read_dir(entry.unwrap().path())
+                .unwrap()
+                .next()
+                .is_none()
+        }));
     }
 
     #[test]
@@ -577,7 +720,7 @@ mod tests {
                 .resolve_file(&Path::new("/").join(parent).join("tool"))
                 .unwrap();
             let change = backup_installed_file(file).unwrap().unwrap();
-            change.delete_backup().unwrap();
+            change.delete_backup(&root).unwrap();
             assert!(fs::symlink_metadata(target.path().join("usr/bin/tool")).is_err());
             assert_eq!(fs::read(outside.path().join("tool")).unwrap(), b"outside");
         }
