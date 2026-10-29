@@ -57,6 +57,13 @@ impl ProvideItem {
     }
 }
 
+fn extend_provides(value: &str, provides: &mut Vec<ProvideItem>) -> Result<()> {
+    for item in value.split(',') {
+        provides.push(ProvideItem::parse(item)?);
+    }
+    Ok(())
+}
+
 impl fmt::Display for ProvideItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.path.is_empty() {
@@ -214,7 +221,7 @@ impl Metadata {
                         }
                         current_section = Some("Provides");
                         if !field_val.is_empty() {
-                            provides.push(ProvideItem::parse(field_val)?);
+                            extend_provides(field_val, &mut provides)?;
                         }
                     }
                     "Conflicts" => {
@@ -233,7 +240,7 @@ impl Metadata {
                         if let Some(sec) = current_section {
                             match sec {
                                 "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
-                                "Provides" => provides.push(ProvideItem::parse(trimmed)?),
+                                "Provides" => extend_provides(trimmed, &mut provides)?,
                                 "Conflicts" => conflicts.push(trimmed.to_string()),
                                 _ => {}
                             }
@@ -249,7 +256,7 @@ impl Metadata {
                 // Continuation line for multi-line sections
                 match sec {
                     "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
-                    "Provides" => provides.push(ProvideItem::parse(trimmed)?),
+                    "Provides" => extend_provides(trimmed, &mut provides)?,
                     "Conflicts" => conflicts.push(trimmed.to_string()),
                     _ => {}
                 }
