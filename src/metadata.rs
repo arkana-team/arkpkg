@@ -409,6 +409,27 @@ busybox-sh
     }
 
     #[test]
+    fn parses_legacy_comma_separated_provides_as_distinct_capabilities() {
+        let sample = "Name: libforms\nDescription: XForms library\nVersion: 1.0\nArch: x86_64\nProvides: libflimage.so.2=/usr/lib/libflimage.so.2.1.3, libforms.so.2=/usr/lib/libforms.so.2.1.3\n";
+
+        let meta = Metadata::parse(sample).unwrap();
+
+        assert_eq!(
+            meta.provides,
+            vec![
+                ProvideItem {
+                    name: "libflimage.so.2".into(),
+                    path: "/usr/lib/libflimage.so.2.1.3".into(),
+                },
+                ProvideItem {
+                    name: "libforms.so.2".into(),
+                    path: "/usr/lib/libforms.so.2.1.3".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_package_names_that_could_escape_database_paths() {
         for name in ["../outside", "a/b", "", ".hidden", "name with spaces"] {
             let content = format!("Name: {name}\nDescription: test\nVersion: 1.0\nArch: any\n");
