@@ -57,6 +57,13 @@ impl ProvideItem {
     }
 }
 
+fn extend_provides(value: &str, provides: &mut Vec<ProvideItem>) -> Result<()> {
+    for item in value.split(',') {
+        provides.push(ProvideItem::parse(item)?);
+    }
+    Ok(())
+}
+
 impl fmt::Display for ProvideItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.path.is_empty() {
@@ -214,7 +221,7 @@ impl Metadata {
                         }
                         current_section = Some("Provides");
                         if !field_val.is_empty() {
-                            provides.push(ProvideItem::parse(field_val)?);
+                            extend_provides(field_val, &mut provides)?;
                         }
                     }
                     "Conflicts" => {
@@ -233,7 +240,7 @@ impl Metadata {
                         if let Some(sec) = current_section {
                             match sec {
                                 "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
-                                "Provides" => provides.push(ProvideItem::parse(trimmed)?),
+                                "Provides" => extend_provides(trimmed, &mut provides)?,
                                 "Conflicts" => conflicts.push(trimmed.to_string()),
                                 _ => {}
                             }
@@ -249,7 +256,7 @@ impl Metadata {
                 // Continuation line for multi-line sections
                 match sec {
                     "Dependencies" => dependencies.push(DependencyReq::parse(trimmed)?),
-                    "Provides" => provides.push(ProvideItem::parse(trimmed)?),
+                    "Provides" => extend_provides(trimmed, &mut provides)?,
                     "Conflicts" => conflicts.push(trimmed.to_string()),
                     _ => {}
                 }
@@ -399,6 +406,27 @@ busybox-sh
         assert_eq!(meta.dependencies.len(), 2);
         assert_eq!(meta.provides.len(), 2);
         assert_eq!(meta.conflicts.len(), 2);
+    }
+
+    #[test]
+    fn parses_legacy_comma_separated_provides_as_distinct_capabilities() {
+        let sample = "Name: libforms\nDescription: XForms library\nVersion: 1.0\nArch: x86_64\nProvides: libflimage.so.2=/usr/lib/libflimage.so.2.1.3, libforms.so.2=/usr/lib/libforms.so.2.1.3\n";
+
+        let meta = Metadata::parse(sample).unwrap();
+
+        assert_eq!(
+            meta.provides,
+            vec![
+                ProvideItem {
+                    name: "libflimage.so.2".into(),
+                    path: "/usr/lib/libflimage.so.2.1.3".into(),
+                },
+                ProvideItem {
+                    name: "libforms.so.2".into(),
+                    path: "/usr/lib/libforms.so.2.1.3".into(),
+                },
+            ]
+        );
     }
 
     #[test]
