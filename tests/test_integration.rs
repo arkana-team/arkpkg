@@ -1175,3 +1175,146 @@ fn verifier_requires_expected_hashes_for_success() {
         assert_eq!(fs::read_to_string(&metadata_path).unwrap(), metadata);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_replacing_intermediate_database_aliases() {
+    use std::os::unix::fs::symlink;
+
+    for reserved in ["etc", "etc/arkpkg", "etc/arkpkg/packages"] {
+        for alias in ["a-link", "bridge", "staging/real"] {
+            for link_payload in [false, true] {
+                let source = TempDir::new().unwrap();
+                let root = TempDir::new().unwrap();
+                let output = TempDir::new().unwrap();
+                fs::create_dir(root.path().join("original")).unwrap();
+                fs::create_dir(root.path().join("staging")).unwrap();
+                symlink("bridge/real", root.path().join("a-link")).unwrap();
+                symlink("staging", root.path().join("bridge")).unwrap();
+                symlink("../original", root.path().join("staging/real")).unwrap();
+                let reserved = root.path().join(reserved);
+                fs::create_dir_all(reserved.parent().unwrap()).unwrap();
+                let depth = reserved
+                    .parent()
+                    .unwrap()
+                    .strip_prefix(root.path())
+                    .unwrap()
+                    .components()
+                    .count();
+                // The alias before /.. must also remain protected even though it
+                // disappears from the final canonical path.
+                let target = PathBuf::from("../".repeat(depth)).join("a-link/../original");
+                symlink(&target, &reserved).unwrap();
+                let db = Database::new(root.path());
+                db.add_installed_package("existing", &Version::parse("1.0").unwrap())
+                    .unwrap();
+                db.add_file_ownership(&[PathBuf::from("/usr/bin/existing")], "existing")
+                    .unwrap();
+                let info =
+                    arkpkg::database::ArkInfo::parse("Name: existing\nVersion: 1.0\n").unwrap();
+                db.write_arkinfo(&info).unwrap();
+                let package_before = fs::read(root.path().join("etc/arkpkg/package.db")).unwrap();
+                let file_before = fs::read(root.path().join("etc/arkpkg/file.db")).unwrap();
+                let original_alias = fs::read_link(root.path().join(alias)).unwrap();
+
+                fs::write(source.path().join("ARKPKG"), "Name: aliasguard\nDescription: protect database resolution\nVersion: 1.0\nArch: any\n").unwrap();
+                let payload = source.path().join("package").join(alias);
+                fs::create_dir_all(payload.parent().unwrap()).unwrap();
+                fs::write(
+                    source.path().join("package/0-marker"),
+                    b"must not be copied",
+                )
+                .unwrap();
+                if link_payload {
+                    symlink("forged", &payload).unwrap();
+                } else {
+                    fs::write(&payload, b"replacement").unwrap();
+                }
+                let archive = output.path().join("attack.ark");
+                create_ark(source.path(), &archive).unwrap();
+                let logger = Logger::new(root.path());
+                let result = Installer::new(&db, &logger, PromptHandler::new(true, false, true))
+                    .install(&archive);
+                assert!(
+                    matches!(result, Err(ArkError::InvalidPackage(_))),
+                    "accepted {reserved:?}, {alias}, symlink={link_payload}: {result:?}"
+                );
+                assert!(!root.path().join("0-marker").exists());
+                assert_eq!(
+                    fs::read_link(root.path().join(alias)).unwrap(),
+                    original_alias
+                );
+                assert_eq!(fs::read_link(&reserved).unwrap(), target);
+                assert_eq!(
+                    fs::read(root.path().join("etc/arkpkg/package.db")).unwrap(),
+                    package_before
+                );
+                assert_eq!(
+                    fs::read(root.path().join("etc/arkpkg/file.db")).unwrap(),
+                    file_before
+                );
+                assert_eq!(db.read_arkinfo("existing").unwrap(), info);
+                assert!(db.read_arkinfo("aliasguard").is_err());
+
+                // Ordinary payloads must still work with this supported layout.
+                fs::remove_file(&payload).unwrap();
+                fs::remove_file(source.path().join("package/0-marker")).unwrap();
+                fs::write(source.path().join("package/tool"), b"ordinary payload").unwrap();
+                create_ark(source.path(), &archive).unwrap();
+                Installer::new(&db, &logger, PromptHandler::new(true, false, true))
+                    .install(&archive)
+                    .unwrap();
+                assert!(db.is_installed("existing").unwrap().is_some());
+                assert!(db.is_installed("aliasguard").unwrap().is_some());
+                assert_eq!(
+                    fs::read(root.path().join("tool")).unwrap(),
+                    b"ordinary payload"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_alias_redirection_to_payload_database() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::create_dir_all(root.path().join("original/arkpkg/packages")).unwrap();
+    symlink("original", root.path().join("state-link")).unwrap();
+    symlink("state-link", root.path().join("etc")).unwrap();
+    let db = Database::new(root.path());
+    db.add_installed_package("existing", &Version::parse("1.0").unwrap())
+        .unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: redirectattack\nDescription: database alias redirection\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    fs::create_dir_all(source.path().join("package/forged/arkpkg/packages")).unwrap();
+    fs::write(
+        source.path().join("package/forged/arkpkg/package.db"),
+        "injected 9.0\n",
+    )
+    .unwrap();
+    fs::write(source.path().join("package/forged/arkpkg/file.db"), "").unwrap();
+    symlink("forged", source.path().join("package/state-link")).unwrap();
+    let archive = output.path().join("attack.ark");
+    create_ark(source.path(), &archive).unwrap();
+    let logger = Logger::new(root.path());
+    assert!(matches!(
+        Installer::new(&db, &logger, PromptHandler::new(true, false, true)).install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert_eq!(
+        fs::read_link(root.path().join("state-link")).unwrap(),
+        PathBuf::from("original")
+    );
+    assert!(db.is_installed("existing").unwrap().is_some());
+    assert!(db.is_installed("injected").unwrap().is_none());
+    assert!(db.is_installed("redirectattack").unwrap().is_none());
+    assert!(!root.path().join("forged").exists());
+}
