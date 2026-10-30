@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, renameat, statat, unlinkat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, fstat, open, openat, renameat, statat, unlinkat,
+};
 
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
@@ -296,19 +298,12 @@ impl RemovalRoot {
         // Canonicalization preserves support for in-root directory symlinks.
         // Reopen each canonical component without following links: a concurrent
         // replacement can fail resolution, but cannot escape the pinned root.
-        // Reuse pinned handles so a package with many files in the same parent
-        // does not consume one file descriptor per payload path during removal.
         for part in relative.components() {
             let Component::Normal(name) = part else {
                 return Err(ArkError::InvalidPackage("Unsafe removal parent".into()));
             };
             current.push(name);
-            if let Some(cached) = self.directories.borrow().get(&current) {
-                dir = Rc::clone(cached);
-                continue;
-            }
-
-            let opened = Rc::new(
+            dir = Rc::new(
                 openat(
                     &*dir,
                     name,
@@ -317,11 +312,23 @@ impl RemovalRoot {
                 )
                 .map_err(io::Error::from)?,
             );
-            self.directories
-                .borrow_mut()
-                .insert(current.clone(), Rc::clone(&opened));
-            dir = opened;
         }
+
+        // Reuse a pinned handle only after reopening the path from the root
+        // and confirming it still names the same directory. This bounds file
+        // descriptors by distinct parents without trusting stale cached paths.
+        if let Some(cached) = self.directories.borrow().get(&current) {
+            let opened_stat = fstat(&*dir).map_err(io::Error::from)?;
+            let cached_stat = fstat(&**cached).map_err(io::Error::from)?;
+            if opened_stat.st_dev == cached_stat.st_dev && opened_stat.st_ino == cached_stat.st_ino
+            {
+                return Ok(Rc::clone(cached));
+            }
+        }
+
+        self.directories
+            .borrow_mut()
+            .insert(current, Rc::clone(&dir));
         Ok(dir)
     }
 }
@@ -480,6 +487,44 @@ mod tests {
                 .iter()
                 .all(|file| Rc::ptr_eq(&file.parent, &files[0].parent))
         );
+    }
+
+    #[test]
+    fn cached_parent_is_reopened_after_directory_moves_outside_root() {
+        let target = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        fs::write(target.path().join("usr/share/nscde/inside"), b"inside").unwrap();
+        fs::write(outside.path().join("outside"), b"outside").unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let original = root
+            .resolve_file(Path::new("/usr/share/nscde/original"))
+            .unwrap();
+
+        fs::rename(
+            target.path().join("usr/share/nscde"),
+            outside.path().join("nscde"),
+        )
+        .unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        fs::write(target.path().join("usr/share/nscde/inside"), b"inside").unwrap();
+
+        let current = root
+            .resolve_file(Path::new("/usr/share/nscde/inside"))
+            .unwrap();
+        assert!(!Rc::ptr_eq(&original.parent, &current.parent));
+        let change = backup_installed_file(current).unwrap().unwrap();
+        change.delete_backup().unwrap();
+
+        assert_eq!(
+            fs::read(outside.path().join("outside")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("nscde/inside")).unwrap(),
+            b"inside"
+        );
+        assert!(fs::symlink_metadata(target.path().join("usr/share/nscde/inside")).is_err());
     }
 
     #[test]
