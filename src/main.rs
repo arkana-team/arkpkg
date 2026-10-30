@@ -5,7 +5,7 @@ use std::process;
 
 use arkpkg::cli::{Cli, Commands, RepositoryCommands};
 use arkpkg::database::Database;
-use arkpkg::errors::Result;
+use arkpkg::errors::{ArkError, Result};
 use arkpkg::installer::Installer;
 use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
@@ -111,14 +111,17 @@ fn run() -> Result<()> {
 }
 
 fn format_repository_search_result(repo_name: &str, package: &RepositoryPackage) -> String {
-    let result = format!(
+    escape_terminal_text(&format!(
         "{} {} [{}] ({}) - {}",
         package.name, package.version, package.arch, repo_name, package.description
-    );
-    let mut escaped = String::with_capacity(result.len());
-    // Repository text must not execute terminal controls or inject result lines.
-    for character in result.chars() {
-        if character.is_control() {
+    ))
+}
+
+fn escape_terminal_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    // Untrusted text must not execute terminal controls or inject diagnostic lines.
+    for character in text.chars() {
+        if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
             escaped.extend(character.escape_default());
         } else {
             escaped.push(character);
@@ -127,14 +130,27 @@ fn format_repository_search_result(repo_name: &str, package: &RepositoryPackage)
     escaped
 }
 
+fn format_error(error: &ArkError) -> String {
+    match error {
+        // Escape the field before adding this variant's intentional line break.
+        ArkError::MissingDependency(dependency) => {
+            ArkError::MissingDependency(escape_terminal_text(dependency)).to_string()
+        }
+        _ => escape_terminal_text(&error.to_string()),
+    }
+}
+
 fn main() {
     // Set clean panic hook to avoid displaying raw Rust panic messages to users
     std::panic::set_hook(Box::new(|info| {
-        eprintln!("Unexpected internal error: {}", info);
+        eprintln!(
+            "Unexpected internal error: {}",
+            escape_terminal_text(&info.to_string())
+        );
     }));
 
     if let Err(err) = run() {
-        eprintln!("{}", err);
+        eprintln!("{}", format_error(&err));
         process::exit(err.exit_code());
     }
 }
@@ -142,6 +158,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_escape_controls_in_all_untrusted_fields() {
+        let controls: String = ('\u{0}'..='\u{1f}')
+            .chain('\u{7f}'..='\u{9f}')
+            .chain(['\u{2028}', '\u{2029}'])
+            .collect();
+        let errors = [
+            ArkError::Generic(controls.clone()),
+            ArkError::PackageNotFound(controls.clone()),
+            ArkError::MissingDependency(controls.clone()),
+            ArkError::ArchitectureMismatch {
+                package_arch: controls.clone(),
+                system_arch: controls.clone(),
+            },
+            ArkError::VerificationFailed(controls.clone()),
+            ArkError::PackageAlreadyInstalled(controls.clone()),
+            ArkError::PackageConflict(controls.clone()),
+            ArkError::InvalidPackage(controls.clone()),
+            ArkError::PermissionDenied(controls.clone()),
+            ArkError::Io(std::io::Error::other(controls)),
+        ];
+        for error in errors {
+            let rendered = format_error(&error);
+            let line_breaks = usize::from(matches!(error, ArkError::MissingDependency(_)));
+            assert_eq!(rendered.matches('\n').count(), line_breaks);
+            assert!(!rendered.chars().any(|c| {
+                (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}')
+            }));
+            assert!(rendered.contains(r"\u{1b}"));
+            assert!(rendered.contains(r"\r"));
+            assert!(rendered.contains(r"\n"));
+            assert!(rendered.contains(r"\u{2028}\u{2029}"));
+        }
+    }
+
+    #[test]
+    fn errors_preserve_printable_text_and_intentional_formatting() {
+        let text = r#"Café 日本語 🦀: "quoted" C:\bin; it's useful!"#;
+        let error = ArkError::InvalidPackage(text.into());
+        assert_eq!(format_error(&error), error.to_string());
+        let error = ArkError::MissingDependency(format!("{text}\nforged\x1b[2J"));
+        assert_eq!(
+            format_error(&error),
+            format!(
+                "Missing dependency: {text}\\nforged\\u{{1b}}[2J\nPlease install the required package before continuing."
+            )
+        );
+        assert_eq!(
+            format_error(&ArkError::UserCancelled),
+            "User cancelled operation"
+        );
+    }
 
     fn package() -> RepositoryPackage {
         serde_json::from_str(
