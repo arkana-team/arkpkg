@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{
@@ -242,7 +242,7 @@ struct RemovalRoot {
     path: PathBuf,
     canonical_path: PathBuf,
     dir: Rc<OwnedFd>,
-    directories: RefCell<HashMap<PathBuf, Rc<OwnedFd>>>,
+    directories: RefCell<HashMap<PathBuf, Weak<OwnedFd>>>,
 }
 
 impl RemovalRoot {
@@ -261,6 +261,7 @@ impl RemovalRoot {
         })
     }
 
+    /// Resolve a target-root path while retaining its verified parent directory.
     fn resolve_file(&self, path: &Path) -> Result<ResolvedFile> {
         let relative = path.strip_prefix("/").map_err(|_| {
             ArkError::InvalidPackage(format!("Invalid removal path '{}'", path.display()))
@@ -288,6 +289,7 @@ impl RemovalRoot {
         })
     }
 
+    /// Open a directory beneath the pinned root, reusing only live verified handles.
     fn open_dir(&self, relative: &Path) -> Result<Rc<OwnedFd>> {
         if relative.as_os_str().is_empty() {
             return Ok(Rc::clone(&self.dir));
@@ -317,18 +319,23 @@ impl RemovalRoot {
         // Reuse a pinned handle only after reopening the path from the root
         // and confirming it still names the same directory. This bounds file
         // descriptors by distinct parents without trusting stale cached paths.
-        if let Some(cached) = self.directories.borrow().get(&current) {
+        if let Some(cached) = self
+            .directories
+            .borrow()
+            .get(&current)
+            .and_then(Weak::upgrade)
+        {
             let opened_stat = fstat(&*dir).map_err(io::Error::from)?;
-            let cached_stat = fstat(&**cached).map_err(io::Error::from)?;
+            let cached_stat = fstat(&*cached).map_err(io::Error::from)?;
             if opened_stat.st_dev == cached_stat.st_dev && opened_stat.st_ino == cached_stat.st_ino
             {
-                return Ok(Rc::clone(cached));
+                return Ok(cached);
             }
         }
 
         self.directories
             .borrow_mut()
-            .insert(current, Rc::clone(&dir));
+            .insert(current, Rc::downgrade(&dir));
         Ok(dir)
     }
 }
@@ -487,6 +494,24 @@ mod tests {
                 .iter()
                 .all(|file| Rc::ptr_eq(&file.parent, &files[0].parent))
         );
+    }
+
+    #[test]
+    fn directory_cache_does_not_keep_unused_parent_descriptors_open() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let parent = root.open_dir(Path::new("usr/share/nscde")).unwrap();
+        let cached = root
+            .directories
+            .borrow()
+            .get(Path::new("usr/share/nscde"))
+            .unwrap()
+            .clone();
+
+        assert_eq!(cached.strong_count(), 1);
+        drop(parent);
+        assert_eq!(cached.strong_count(), 0);
     }
 
     #[test]
