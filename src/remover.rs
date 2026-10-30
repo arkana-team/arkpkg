@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -239,6 +240,7 @@ struct RemovalRoot {
     path: PathBuf,
     canonical_path: PathBuf,
     dir: Rc<OwnedFd>,
+    directories: RefCell<HashMap<PathBuf, Rc<OwnedFd>>>,
 }
 
 impl RemovalRoot {
@@ -253,6 +255,7 @@ impl RemovalRoot {
             path: path.to_path_buf(),
             canonical_path: path.canonicalize()?,
             dir: Rc::new(dir),
+            directories: RefCell::new(HashMap::new()),
         })
     }
 
@@ -284,15 +287,28 @@ impl RemovalRoot {
     }
 
     fn open_dir(&self, relative: &Path) -> Result<Rc<OwnedFd>> {
+        if relative.as_os_str().is_empty() {
+            return Ok(Rc::clone(&self.dir));
+        }
+
         let mut dir = Rc::clone(&self.dir);
+        let mut current = PathBuf::new();
         // Canonicalization preserves support for in-root directory symlinks.
         // Reopen each canonical component without following links: a concurrent
         // replacement can fail resolution, but cannot escape the pinned root.
+        // Reuse pinned handles so a package with many files in the same parent
+        // does not consume one file descriptor per payload path during removal.
         for part in relative.components() {
             let Component::Normal(name) = part else {
                 return Err(ArkError::InvalidPackage("Unsafe removal parent".into()));
             };
-            dir = Rc::new(
+            current.push(name);
+            if let Some(cached) = self.directories.borrow().get(&current) {
+                dir = Rc::clone(cached);
+                continue;
+            }
+
+            let opened = Rc::new(
                 openat(
                     &*dir,
                     name,
@@ -301,6 +317,10 @@ impl RemovalRoot {
                 )
                 .map_err(io::Error::from)?,
             );
+            self.directories
+                .borrow_mut()
+                .insert(current.clone(), Rc::clone(&opened));
+            dir = opened;
         }
         Ok(dir)
     }
@@ -440,6 +460,27 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn repeated_files_reuse_the_same_pinned_parent_descriptor() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+
+        let files: Vec<_> = (0..10_000)
+            .map(|index| {
+                root.resolve_file(&Path::new("/usr/share/nscde").join(format!("file-{index}")))
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(files.len(), 10_000);
+        assert!(
+            files
+                .iter()
+                .all(|file| Rc::ptr_eq(&file.parent, &files[0].parent))
+        );
+    }
 
     #[test]
     fn staging_and_cleanup_stay_in_the_opened_parent_after_ancestor_replacement() {
