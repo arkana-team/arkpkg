@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use tempfile::NamedTempFile;
 
 use crate::archive::extract_ark;
@@ -44,24 +46,49 @@ where
         installed: read_installed(database)?,
         completed: Vec::new(),
         visiting: Vec::new(),
+        satisfied_requirements: HashSet::new(),
         downloaded_bytes: 0,
     };
     resolver.resolve(&root_requirement, true)?;
-    Ok(resolver.completed)
+    Ok(resolver
+        .completed
+        .into_iter()
+        .map(|(package, _)| package)
+        .collect())
 }
 
-struct InstalledPackage {
+struct IndexedPackage {
     name: String,
     version: Version,
-    provides: Vec<ProvideItem>,
+    provides: HashSet<String>,
+}
+
+impl IndexedPackage {
+    fn new(name: String, version: Version, provides: &[ProvideItem]) -> Self {
+        Self {
+            name,
+            version,
+            provides: provides
+                .iter()
+                .map(|provide| provide.name.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn satisfies(&self, normalized_name: &str, requirement: &DependencyReq) -> bool {
+        (self.name.eq_ignore_ascii_case(normalized_name) || self.provides.contains(normalized_name))
+            && requirement.is_satisfied_by(&self.version)
+    }
 }
 
 struct DependencyResolver<'a, F> {
     database: &'a Database,
     download: F,
-    installed: Vec<InstalledPackage>,
-    completed: Vec<ResolvedPackage>,
-    visiting: Vec<Metadata>,
+    installed: Vec<IndexedPackage>,
+    completed: Vec<(ResolvedPackage, IndexedPackage)>,
+    visiting: Vec<IndexedPackage>,
+    // Only successful matches are stable as the install plan grows.
+    satisfied_requirements: HashSet<String>,
     downloaded_bytes: u64,
 }
 
@@ -70,22 +97,33 @@ where
     F: FnMut(&DependencyReq) -> Result<NamedTempFile>,
 {
     fn resolve(&mut self, requirement: &DependencyReq, root: bool) -> Result<()> {
-        if !root && self.installed_satisfies(requirement) {
+        // Display retains the operator and raw version. Normalize only the name:
+        // version strings can contain case-sensitive segments.
+        let mut requirement_key = requirement.to_string();
+        requirement_key[..requirement.name.len()].make_ascii_lowercase();
+        let normalized_name = &requirement_key[..requirement.name.len()];
+        if !root && self.satisfied_requirements.contains(&requirement_key) {
             return Ok(());
         }
 
-        if self
-            .completed
-            .iter()
-            .any(|package| metadata_satisfies(&package.metadata, requirement))
+        if (!root
+            && self
+                .installed
+                .iter()
+                .any(|package| package.satisfies(normalized_name, requirement)))
+            || self
+                .completed
+                .iter()
+                .any(|(_, package)| package.satisfies(normalized_name, requirement))
         {
+            self.satisfied_requirements.insert(requirement_key);
             return Ok(());
         }
 
         if let Some(index) = self
             .visiting
             .iter()
-            .position(|metadata| metadata_satisfies(metadata, requirement))
+            .position(|package| package.satisfies(normalized_name, requirement))
         {
             let mut cycle: Vec<&str> = self.visiting[index..]
                 .iter()
@@ -98,7 +136,7 @@ where
             )));
         }
 
-        if let Some(existing) = self.completed.iter().find(|package| {
+        if let Some((existing, _)) = self.completed.iter().find(|(package, _)| {
             package
                 .metadata
                 .name
@@ -146,7 +184,12 @@ where
 
         let extraction = crate::temp::directory()?;
         let metadata = extract_ark(archive.path(), extraction.path())?;
-        if !metadata_satisfies(&metadata, requirement) {
+        let indexed = IndexedPackage::new(
+            metadata.name.clone(),
+            metadata.version.clone(),
+            &metadata.provides,
+        );
+        if !indexed.satisfies(normalized_name, requirement) {
             return Err(ArkError::VerificationFailed(format!(
                 "Downloaded package '{}' does not satisfy '{}'",
                 metadata.name, requirement
@@ -173,39 +216,23 @@ where
             )));
         }
 
-        let dependencies = metadata.dependencies.clone();
-        self.visiting.push(metadata.clone());
-        for dependency in &dependencies {
+        self.visiting.push(indexed);
+        for dependency in &metadata.dependencies {
             self.resolve(dependency, false)?;
         }
-        self.visiting.pop();
+        let indexed = self
+            .visiting
+            .pop()
+            .expect("resolving dependencies retains the visiting package");
 
-        self.completed.push(ResolvedPackage { metadata, archive });
+        self.completed
+            .push((ResolvedPackage { metadata, archive }, indexed));
+        self.satisfied_requirements.insert(requirement_key);
         Ok(())
     }
-
-    fn installed_satisfies(&self, requirement: &DependencyReq) -> bool {
-        self.installed.iter().any(|package| {
-            (package.name.eq_ignore_ascii_case(&requirement.name)
-                || package
-                    .provides
-                    .iter()
-                    .any(|provide| provide.name.eq_ignore_ascii_case(&requirement.name)))
-                && requirement.is_satisfied_by(&package.version)
-        })
-    }
 }
 
-fn metadata_satisfies(metadata: &Metadata, requirement: &DependencyReq) -> bool {
-    (metadata.name.eq_ignore_ascii_case(&requirement.name)
-        || metadata
-            .provides
-            .iter()
-            .any(|provide| provide.name.eq_ignore_ascii_case(&requirement.name)))
-        && requirement.is_satisfied_by(&metadata.version)
-}
-
-fn read_installed(database: &Database) -> Result<Vec<InstalledPackage>> {
+fn read_installed(database: &Database) -> Result<Vec<IndexedPackage>> {
     Ok(database
         .read_installed_packages()?
         .into_iter()
@@ -214,11 +241,7 @@ fn read_installed(database: &Database) -> Result<Vec<InstalledPackage>> {
                 .read_arkinfo(&name)
                 .map(|info| info.provides)
                 .unwrap_or_default();
-            InstalledPackage {
-                name,
-                version,
-                provides,
-            }
+            IndexedPackage::new(name, version, &provides)
         })
         .collect())
 }
@@ -236,24 +259,171 @@ mod tests {
     use crate::prompt::PromptHandler;
     use tempfile::TempDir;
 
+    fn test_archive(directory: &TempDir, name: &str, sections: &str) -> std::path::PathBuf {
+        let source = directory.path().join(format!("source-{name}"));
+        fs::create_dir_all(source.join("package")).unwrap();
+        fs::write(
+            source.join("ARKPKG"),
+            format!("Name: {name}\nDescription: resolver test\nVersion: 1\nArch: any\n{sections}"),
+        )
+        .unwrap();
+        let archive = directory.path().join(format!("{name}.ark"));
+        create_ark(source, &archive).unwrap();
+        archive
+    }
+
+    #[test]
+    fn dependency_plan_handles_many_providers_and_repeated_requirements() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::new(temp.path().join("root"));
+        database.init().unwrap();
+        let provides = (0..8000)
+            .map(|index| format!("v{index:04}\n"))
+            .collect::<String>();
+        let base = test_archive(&temp, "base", &format!("Provides:\n{provides}vlast\n"));
+
+        for dependencies in [
+            "vlast>=1\n".repeat(6000),
+            (0..6000).map(|index| format!("v{index:04}>=1\n")).collect(),
+        ] {
+            let app = test_archive(
+                &temp,
+                "app",
+                &format!("Dependencies:\nbase\n{dependencies}"),
+            );
+            let mut downloads = Vec::new();
+            let plan = resolve_install_plan_with(&database, "app", |requirement| {
+                downloads.push(requirement.name.clone());
+                let path = match requirement.name.as_str() {
+                    "app" => &app,
+                    "base" => &base,
+                    _ => panic!("provider requirement should already be satisfied"),
+                };
+                let mut temporary = NamedTempFile::new().unwrap();
+                std::io::copy(&mut fs::File::open(path).unwrap(), &mut temporary).unwrap();
+                Ok(temporary)
+            })
+            .unwrap();
+            assert_eq!(downloads, ["app", "base"]);
+            let names: Vec<_> = plan
+                .iter()
+                .map(|package| package.metadata.name.as_str())
+                .collect();
+            assert_eq!(names, ["base", "app"]);
+            assert!(database.read_installed_packages().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn metadata_satisfaction_checks_names_provides_and_version_constraints() {
         let metadata = Metadata::parse(
-            "Name: shell\nDescription: test shell\nVersion: 2.1\nArch: any\nProvides:\nsh=/bin/sh\n",
+            "Name: shell\nDescription: test shell\nVersion: 2.1\nArch: any\nProvides:\nSh=/bin/sh\nsH=/usr/bin/sh\n",
         )
         .unwrap();
-        assert!(metadata_satisfies(
-            &metadata,
-            &DependencyReq::parse("shell>=2.0").unwrap()
-        ));
-        assert!(metadata_satisfies(
-            &metadata,
-            &DependencyReq::parse("sh>=2.0").unwrap()
-        ));
-        assert!(!metadata_satisfies(
-            &metadata,
-            &DependencyReq::parse("sh>=3.0").unwrap()
-        ));
+        let package = IndexedPackage::new(metadata.name, metadata.version, &metadata.provides);
+        assert_eq!(package.provides.len(), 1);
+        for (text, expected) in [
+            ("SHELL>=2.0", true),
+            ("SH>=2.0", true),
+            ("sh>=3.0", false),
+            ("sh==2.1.0", true),
+            ("sh!=2.1", false),
+            ("sh<2.1", false),
+            ("sh<=2.1", true),
+            ("sh>2.0", true),
+            ("missing", false),
+        ] {
+            let requirement = DependencyReq::parse(text).unwrap();
+            assert_eq!(
+                package.satisfies(&requirement.name.to_ascii_lowercase(), &requirement),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_satisfaction_preserves_version_constraints() {
+        for name in ["base", "vlast"] {
+            for constraint in ["<1", ">1", "!=1", "==2"] {
+                let temp = TempDir::new().unwrap();
+                let database = Database::new(temp.path().join("root"));
+                database.init().unwrap();
+                let base = test_archive(&temp, "base", "Provides:\nvlast\n");
+                let app = test_archive(
+                    &temp,
+                    "app",
+                    &format!("Dependencies:\nbase\n{name}>=1\n{name}>=1\n{name}{constraint}\n"),
+                );
+                let error = resolve_install_plan_with(&database, "app", |requirement| {
+                    let path = match requirement.name.as_str() {
+                        "app" => &app,
+                        "base" => &base,
+                        "vlast" => return Err(ArkError::PackageNotFound(requirement.to_string())),
+                        _ => panic!("unexpected download"),
+                    };
+                    let mut temporary = NamedTempFile::new().unwrap();
+                    std::io::copy(&mut fs::File::open(path).unwrap(), &mut temporary).unwrap();
+                    Ok(temporary)
+                })
+                .unwrap_err();
+                if name == "base" {
+                    assert!(matches!(error, ArkError::PackageConflict(_)));
+                } else {
+                    assert!(matches!(error, ArkError::PackageNotFound(_)));
+                }
+                assert!(error.to_string().contains(&format!("{name}{constraint}")));
+                assert!(database.read_installed_packages().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_providers_still_detect_dependency_cycles() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::new(temp.path().join("root"));
+        database.init().unwrap();
+        let first = test_archive(
+            &temp,
+            "first",
+            "Dependencies:\nsecond\nProvides:\nvirtual-first\n",
+        );
+        let second = test_archive(&temp, "second", "Dependencies:\nVIRTUAL-FIRST>=1\n");
+        let error = resolve_install_plan_with(&database, "first", |requirement| {
+            let path = match requirement.name.as_str() {
+                "first" => &first,
+                "second" => &second,
+                _ => panic!("cycle must be detected before another download"),
+            };
+            let mut temporary = NamedTempFile::new().unwrap();
+            std::io::copy(&mut fs::File::open(path).unwrap(), &mut temporary).unwrap();
+            Ok(temporary)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("first -> second -> first"));
+        assert!(database.read_installed_packages().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_satisfaction_keeps_version_case() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::new(temp.path().join("root"));
+        database.init().unwrap();
+        database
+            .add_installed_package("base", &Version::parse("1A").unwrap())
+            .unwrap();
+        let app = test_archive(&temp, "app", "Dependencies:\nbase==1A\nBASE==1a\n");
+        let error = resolve_install_plan_with(&database, "app", |requirement| {
+            if requirement.name != "app" {
+                return Err(ArkError::PackageNotFound(requirement.to_string()));
+            }
+            let mut temporary = NamedTempFile::new().unwrap();
+            std::io::copy(&mut fs::File::open(&app).unwrap(), &mut temporary).unwrap();
+            Ok(temporary)
+        })
+        .unwrap_err();
+        assert!(matches!(error, ArkError::PackageNotFound(_)));
+        assert!(error.to_string().contains("BASE==1a"));
     }
 
     #[test]
@@ -358,7 +528,7 @@ mod tests {
         fs::create_dir_all(app_source.join("package/usr/share")).unwrap();
         fs::write(
             app_source.join("ARKPKG"),
-            "Name: app\nDescription: depends on a provided feature\nVersion: 1.0\nArch: any\nDependencies:\nvirtual-base>=1.0\n",
+            "Name: app\nDescription: depends on a provided feature\nVersion: 1.0\nArch: any\nDependencies:\nvirtual-base>=1.0\nVIRTUAL-BASE>=1.0\nvirtual-base>0\n",
         )
         .unwrap();
         let app_archive = temp.path().join("app.ark");
