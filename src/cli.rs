@@ -33,10 +33,10 @@ pub struct Cli {
 pub enum Commands {
     /// Install a package archive or package name from a repository
     Install {
-        /// Path to a .ark archive or package name from a configured repository
+        /// Repository package name, or explicit archive path (e.g. ./package.ark)
         package: String,
 
-        /// Restrict package and dependency lookup to this configured repository
+        /// Restrict package and dependency lookup to this repository; incompatible with local paths
         #[arg(long)]
         repo: Option<String>,
     },

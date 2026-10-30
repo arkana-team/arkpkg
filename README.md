@@ -10,6 +10,16 @@
 
 to understand how the arkana package manager works, read https://debarkak.xyz/notes/arkanaos-package-manager/
 
+## Installing packages
+
+Bare names always resolve through configured repositories, even if a same-named
+file exists in the current directory. Use `arkpkg install hello --repo main` to
+restrict package and dependency lookup to one repository.
+
+To install a local archive, use an explicit path such as
+`arkpkg install ./hello.ark`, `arkpkg install packages/hello.ark`, or an absolute
+path. Local archive paths cannot be combined with `--repo`.
+
 ## Repository package metadata limits
 
 When validating a downloaded package, arkpkg accepts at most 1 MiB (1,048,576

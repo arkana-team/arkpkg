@@ -5,7 +5,7 @@ use std::process;
 
 use arkpkg::cli::{Cli, Commands, RepositoryCommands};
 use arkpkg::database::Database;
-use arkpkg::errors::Result;
+use arkpkg::errors::{ArkError, Result};
 use arkpkg::installer::Installer;
 use arkpkg::logger::Logger;
 use arkpkg::prompt::PromptHandler;
@@ -33,10 +33,15 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Install { package, repo } => {
-            let local_path = PathBuf::from(&package);
-            if local_path.is_file() {
+            // Bare names always use repositories, regardless of files in the current directory.
+            if package.contains(std::path::is_separator) {
+                if repo.is_some() {
+                    return Err(ArkError::InvalidPackage(
+                        "Cannot combine a local archive path with --repo".into(),
+                    ));
+                }
                 let mut installer = Installer::new(&db, &logger, prompt);
-                installer.install(local_path)?;
+                installer.install(PathBuf::from(&package))?;
             } else {
                 let catalog = repositories.catalog(repo.as_deref())?;
                 let plan = resolve_install_plan(&db, &catalog, &package)?;
