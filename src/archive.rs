@@ -1,9 +1,11 @@
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder};
+use walkdir::WalkDir;
 
 use crate::errors::{ArkError, Result};
 use crate::metadata::{Metadata, check_metadata_size, read_metadata};
@@ -11,6 +13,60 @@ use crate::metadata::{Metadata, check_metadata_size, read_metadata};
 // Fixed per-package limits apply to local installation and repository resolution.
 const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAX_DECODED_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_PATH_COMPONENTS: usize = 256;
+
+fn check_archive_path_bytes(length: usize) -> Result<()> {
+    if length > MAX_PATH_BYTES {
+        return Err(ArkError::InvalidPackage(format!(
+            "Archive path exceeds the {MAX_PATH_BYTES} byte path limit"
+        )));
+    }
+    Ok(())
+}
+
+fn check_archive_path_components(path: &Path) -> Result<()> {
+    if path.components().take(MAX_PATH_COMPONENTS + 1).count() > MAX_PATH_COMPONENTS {
+        return Err(ArkError::InvalidPackage(format!(
+            "Archive path exceeds the {MAX_PATH_COMPONENTS} component path limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Match symlink ancestors one component at a time without rehashing prefixes.
+#[derive(Default)]
+struct SymlinkPaths {
+    children: HashMap<OsString, Self>,
+    is_symlink: bool,
+}
+
+impl SymlinkPaths {
+    fn contains_ancestor(&self, path: &Path) -> bool {
+        let mut node = self;
+        for component in path.components() {
+            if node.is_symlink {
+                return true;
+            }
+            match node.children.get(component.as_os_str()) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn insert(&mut self, path: &Path) {
+        let mut node = self;
+        for component in path.components() {
+            node = node
+                .children
+                .entry(component.as_os_str().into())
+                .or_default();
+        }
+        node.is_symlink = true;
+    }
+}
 
 /// Bounds all decoded TAR data, including padding and extension records consumed
 /// internally by `tar`. Exhaustion must be an error, not an apparent archive EOF.
@@ -40,6 +96,7 @@ impl<R: Read> Read for ArchiveReader<R> {
 
 /// Extracts an `.ark` (`tar.lz4`) package into a destination directory and parses its `ARKPKG` metadata.
 /// Entries are limited to 2 GiB and total decoded TAR data to 4 GiB, including headers and padding.
+/// Effective entry paths are limited to 4096 bytes and 256 components.
 pub fn extract_ark<P: AsRef<Path>, Q: AsRef<Path>>(
     archive_path: P,
     dest_dir: Q,
@@ -74,7 +131,7 @@ fn extract_ark_with_limits(
         .entries()
         .map_err(|error| ArkError::InvalidPackage(format!("Invalid package archive: {error}")))?;
     let mut seen_paths: HashMap<PathBuf, bool> = HashMap::new();
-    let mut symlink_paths = HashSet::new();
+    let mut symlink_paths = SymlinkPaths::default();
     let mut declared_bytes = 0u64;
     for entry in entries {
         let mut entry = entry.map_err(|error| {
@@ -97,10 +154,14 @@ fn extract_ark_with_limits(
                     "Archive entries exceed the {max_decoded_bytes} byte total limit"
                 ))
             })?;
+        // Bound the effective GNU/PAX path before copying, component processing,
+        // or ancestor lookup. The decoded byte budget also covers extensions.
+        check_archive_path_bytes(entry.path_bytes().len())?;
         let path = entry
             .path()
             .map_err(|error| ArkError::InvalidPackage(format!("Invalid archive path: {error}")))?
             .into_owned();
+        check_archive_path_components(&path)?;
         let safe_relative_path = !path.as_os_str().is_empty()
             && !path.is_absolute()
             && path
@@ -113,12 +174,7 @@ fn extract_ark_with_limits(
                 path.display()
             )));
         }
-        // Check only proper ancestors so unrelated symlinks do not add validation work.
-        if path
-            .ancestors()
-            .skip(1)
-            .any(|ancestor| symlink_paths.contains(ancestor))
-        {
+        if symlink_paths.contains_ancestor(&path) {
             return Err(ArkError::InvalidPackage(format!(
                 "Archive entry '{}' descends through a symlink",
                 path.display()
@@ -169,7 +225,7 @@ fn extract_ark_with_limits(
                     path.display()
                 )));
             }
-            symlink_paths.insert(path.clone());
+            symlink_paths.insert(&path);
         }
         let extracted = entry.unpack_in(dest_dir).map_err(|error| {
             ArkError::InvalidPackage(format!("Failed to extract archive: {error}"))
@@ -226,6 +282,7 @@ fn safe_archive_symlink_target(link_path: &Path, target: &Path) -> bool {
 }
 
 /// Packs a package directory (containing `ARKPKG` and `package/`) into an `.ark` (`tar.lz4`) package.
+/// Applies the same entry path limits as extraction before creating the output.
 pub fn create_ark<P: AsRef<Path>, Q: AsRef<Path>>(source_dir: P, output_ark_path: Q) -> Result<()> {
     let source_dir = source_dir.as_ref();
     let output_ark_path = output_ark_path.as_ref();
@@ -249,6 +306,20 @@ pub fn create_ark<P: AsRef<Path>, Q: AsRef<Path>>(source_dir: P, output_ark_path
     // Validate metadata before packing
     let meta_content = fs::read_to_string(&metadata_path)?;
     let _metadata = Metadata::parse(&meta_content)?;
+
+    // Match append_dir_all's traversal without following payload symlinks.
+    // Reject excessive paths before creating or truncating the output archive.
+    for entry in WalkDir::new(&pkg_dir).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            ArkError::Generic(format!("Failed to inspect package/ directory: {error}"))
+        })?;
+        let path =
+            Path::new("package").join(entry.path().strip_prefix(&pkg_dir).map_err(|error| {
+                ArkError::Generic(format!("Invalid package source path: {error}"))
+            })?);
+        check_archive_path_bytes(path.as_os_str().len())?;
+        check_archive_path_components(&path)?;
+    }
 
     if let Some(parent) = output_ark_path
         .parent()
@@ -294,6 +365,111 @@ mod tests {
         build(&mut archive);
         archive.into_inner().unwrap().finish().unwrap();
         file
+    }
+
+    fn append_extended_path(archive: &mut Builder<FrameEncoder<File>>, path: &str, pax: bool) {
+        if pax {
+            archive
+                .append_pax_extensions([("path", path.as_bytes())])
+                .unwrap();
+        } else {
+            let mut name = path.as_bytes().to_vec();
+            name.push(0);
+            append_entry(archive, "././@LongLink", tar::EntryType::GNULongName, &name);
+        }
+        // The effective extended path must be checked instead of this short header path.
+        append_entry(
+            archive,
+            "package/header",
+            tar::EntryType::Regular,
+            b"payload",
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_effective_paths_before_creating_payload() {
+        for pax in [false, true] {
+            for (path, expected_error) in [
+                (format!("package/{}", "x".repeat(4089)), "byte path limit"),
+                (
+                    format!("package/{}file", "d/".repeat(255)),
+                    "component path limit",
+                ),
+                (
+                    format!("package/{}file", "d/".repeat(32_768)),
+                    "byte path limit",
+                ),
+            ] {
+                let archive = test_archive(|archive| append_extended_path(archive, &path, pax));
+                let dest = TempDir::new().unwrap();
+                let error = extract_ark(archive.path(), dest.path()).unwrap_err();
+                assert!(
+                    matches!(error, ArkError::InvalidPackage(message) if message.contains(expected_error))
+                );
+                assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_effective_paths_at_byte_and_component_limits() {
+        for pax in [false, true] {
+            // Repeated separators keep the filesystem path short while exercising
+            // the exact raw-byte boundary used for extended archive names.
+            for path in [
+                format!("package/{}file", "/".repeat(4084)),
+                format!("package/{}file", "d/".repeat(254)),
+            ] {
+                let archive = test_archive(|archive| {
+                    append_entry(
+                        archive,
+                        "ARKPKG",
+                        tar::EntryType::Regular,
+                        b"Name: pathlimits\nDescription: test\nVersion: 1.0\nArch: any\n",
+                    );
+                    append_entry(archive, "package", tar::EntryType::Directory, b"");
+                    append_extended_path(archive, &path, pax);
+                });
+                let dest = TempDir::new().unwrap();
+                assert_eq!(
+                    extract_ark(archive.path(), dest.path()).unwrap().name,
+                    "pathlimits"
+                );
+                // Resolve components as tar does, avoiding the host's raw path byte limit.
+                let normalized: PathBuf = Path::new(&path).components().collect();
+                assert_eq!(fs::read(dest.path().join(normalized)).unwrap(), b"payload");
+            }
+        }
+    }
+
+    #[test]
+    fn creation_enforces_the_extraction_component_limit_before_truncating_output() {
+        let source = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            b"Name: pathlimits\nDescription: test\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let mut parent = source.path().join("package");
+        for _ in 0..254 {
+            parent.push("d");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("file"), b"payload").unwrap();
+        let archive = output.path().join("bounded.ark");
+        create_ark(source.path(), &archive).unwrap();
+        extract_ark(&archive, dest.path()).unwrap();
+        let original = fs::read(&archive).unwrap();
+
+        fs::create_dir(parent.join("extra")).unwrap();
+        fs::write(parent.join("extra/file"), b"too deep").unwrap();
+        let error = create_ark(source.path(), &archive).unwrap_err();
+        assert!(
+            matches!(error, ArkError::InvalidPackage(message) if message.contains("component path limit"))
+        );
+        assert_eq!(fs::read(archive).unwrap(), original);
     }
 
     #[test]
