@@ -1,11 +1,14 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, renameat, statat, unlinkat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, fstat, open, openat, renameat, statat, unlinkat,
+};
 
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
@@ -239,6 +242,7 @@ struct RemovalRoot {
     path: PathBuf,
     canonical_path: PathBuf,
     dir: Rc<OwnedFd>,
+    directories: RefCell<HashMap<PathBuf, Weak<OwnedFd>>>,
 }
 
 impl RemovalRoot {
@@ -253,9 +257,11 @@ impl RemovalRoot {
             path: path.to_path_buf(),
             canonical_path: path.canonicalize()?,
             dir: Rc::new(dir),
+            directories: RefCell::new(HashMap::new()),
         })
     }
 
+    /// Resolve a target-root path while retaining its verified parent directory.
     fn resolve_file(&self, path: &Path) -> Result<ResolvedFile> {
         let relative = path.strip_prefix("/").map_err(|_| {
             ArkError::InvalidPackage(format!("Invalid removal path '{}'", path.display()))
@@ -283,8 +289,14 @@ impl RemovalRoot {
         })
     }
 
+    /// Open a directory beneath the pinned root, reusing only live verified handles.
     fn open_dir(&self, relative: &Path) -> Result<Rc<OwnedFd>> {
+        if relative.as_os_str().is_empty() {
+            return Ok(Rc::clone(&self.dir));
+        }
+
         let mut dir = Rc::clone(&self.dir);
+        let mut current = PathBuf::new();
         // Canonicalization preserves support for in-root directory symlinks.
         // Reopen each canonical component without following links: a concurrent
         // replacement can fail resolution, but cannot escape the pinned root.
@@ -292,6 +304,7 @@ impl RemovalRoot {
             let Component::Normal(name) = part else {
                 return Err(ArkError::InvalidPackage("Unsafe removal parent".into()));
             };
+            current.push(name);
             dir = Rc::new(
                 openat(
                     &*dir,
@@ -302,6 +315,27 @@ impl RemovalRoot {
                 .map_err(io::Error::from)?,
             );
         }
+
+        // Reuse a pinned handle only after reopening the path from the root
+        // and confirming it still names the same directory. This bounds file
+        // descriptors by distinct parents without trusting stale cached paths.
+        if let Some(cached) = self
+            .directories
+            .borrow()
+            .get(&current)
+            .and_then(Weak::upgrade)
+        {
+            let opened_stat = fstat(&*dir).map_err(io::Error::from)?;
+            let cached_stat = fstat(&*cached).map_err(io::Error::from)?;
+            if opened_stat.st_dev == cached_stat.st_dev && opened_stat.st_ino == cached_stat.st_ino
+            {
+                return Ok(cached);
+            }
+        }
+
+        self.directories
+            .borrow_mut()
+            .insert(current, Rc::downgrade(&dir));
         Ok(dir)
     }
 }
@@ -440,6 +474,83 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    #[test]
+    fn repeated_files_reuse_the_same_pinned_parent_descriptor() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+
+        let files: Vec<_> = (0..10_000)
+            .map(|index| {
+                root.resolve_file(&Path::new("/usr/share/nscde").join(format!("file-{index}")))
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(files.len(), 10_000);
+        assert!(
+            files
+                .iter()
+                .all(|file| Rc::ptr_eq(&file.parent, &files[0].parent))
+        );
+    }
+
+    #[test]
+    fn directory_cache_does_not_keep_unused_parent_descriptors_open() {
+        let target = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let parent = root.open_dir(Path::new("usr/share/nscde")).unwrap();
+        let cached = root
+            .directories
+            .borrow()
+            .get(Path::new("usr/share/nscde"))
+            .unwrap()
+            .clone();
+
+        assert_eq!(cached.strong_count(), 1);
+        drop(parent);
+        assert_eq!(cached.strong_count(), 0);
+    }
+
+    #[test]
+    fn cached_parent_is_reopened_after_directory_moves_outside_root() {
+        let target = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        fs::write(target.path().join("usr/share/nscde/inside"), b"inside").unwrap();
+        fs::write(outside.path().join("outside"), b"outside").unwrap();
+        let root = RemovalRoot::new(target.path()).unwrap();
+        let original = root
+            .resolve_file(Path::new("/usr/share/nscde/original"))
+            .unwrap();
+
+        fs::rename(
+            target.path().join("usr/share/nscde"),
+            outside.path().join("nscde"),
+        )
+        .unwrap();
+        fs::create_dir_all(target.path().join("usr/share/nscde")).unwrap();
+        fs::write(target.path().join("usr/share/nscde/inside"), b"inside").unwrap();
+
+        let current = root
+            .resolve_file(Path::new("/usr/share/nscde/inside"))
+            .unwrap();
+        assert!(!Rc::ptr_eq(&original.parent, &current.parent));
+        let change = backup_installed_file(current).unwrap().unwrap();
+        change.delete_backup().unwrap();
+
+        assert_eq!(
+            fs::read(outside.path().join("outside")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("nscde/inside")).unwrap(),
+            b"inside"
+        );
+        assert!(fs::symlink_metadata(target.path().join("usr/share/nscde/inside")).is_err());
+    }
 
     #[test]
     fn staging_and_cleanup_stay_in_the_opened_parent_after_ancestor_replacement() {
