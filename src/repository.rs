@@ -575,7 +575,7 @@ fn request(url: &str, limit: u64) -> Result<ureq::Response> {
     Ok(response)
 }
 
-fn read_archive_metadata(path: &Path) -> Result<Metadata> {
+pub(crate) fn read_archive_metadata(path: &Path) -> Result<Metadata> {
     let file = File::open(path)?;
     let decoder = FrameDecoder::new(file);
     // Limit below tar so skipped payloads and GNU/PAX extension records also

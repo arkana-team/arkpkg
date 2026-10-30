@@ -4,7 +4,7 @@ use crate::archive::extract_ark;
 use crate::database::Database;
 use crate::errors::{ArkError, Result};
 use crate::metadata::{Metadata, ProvideItem, validate_package_name};
-use crate::repository::RepositoryCatalog;
+use crate::repository::{RepositoryCatalog, read_archive_metadata};
 use crate::version::{DependencyReq, Version};
 
 const MAX_DEPENDENCY_DEPTH: usize = 128;
@@ -26,6 +26,17 @@ pub fn resolve_install_plan(
     resolve_install_plan_with(database, package_name, |requirement| {
         catalog.download_package_matching(requirement)
     })
+}
+
+/// Fully validates a confirmed plan before installing its first package.
+pub fn validate_install_plan(plan: &[ResolvedPackage]) -> Result<()> {
+    for package in plan {
+        // Release each extraction before validating the next package; only one
+        // expanded archive is live, subject to the existing per-archive limits.
+        let extraction = crate::temp::directory()?;
+        extract_ark(package.archive.path(), extraction.path())?;
+    }
+    Ok(())
 }
 
 fn resolve_install_plan_with<F>(
@@ -144,8 +155,8 @@ where
                 ))
             })?;
 
-        let extraction = crate::temp::directory()?;
-        let metadata = extract_ark(archive.path(), extraction.path())?;
+        // Planning needs only bounded metadata; full validation follows confirmation.
+        let metadata = read_archive_metadata(archive.path())?;
         if !metadata_satisfies(&metadata, requirement) {
             return Err(ArkError::VerificationFailed(format!(
                 "Downloaded package '{}' does not satisfy '{}'",
@@ -297,6 +308,78 @@ mod tests {
             .map(|package| package.metadata.name.as_str())
             .collect();
         assert_eq!(names, ["base", "lib", "app"]);
+        validate_install_plan(&plan).unwrap();
+    }
+
+    #[test]
+    fn dependency_planning_reads_metadata_without_expanding_payloads() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::new(temp.path());
+        database.init().unwrap();
+
+        let plan = resolve_install_plan_with(&database, "app", |requirement| {
+            let dependencies = if requirement.name == "app" {
+                "Dependencies:\nlib\n"
+            } else {
+                assert_eq!(requirement.name, "lib");
+                ""
+            };
+            let metadata = format!(
+                "Name: {}\nDescription: test package\nVersion: 1.0\nArch: any\n{dependencies}",
+                requirement.name
+            );
+            let mut file = NamedTempFile::new().unwrap();
+            let mut archive =
+                tar::Builder::new(lz4_flex::frame::FrameEncoder::new(file.as_file_mut()));
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len() as u64);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, "ARKPKG", metadata.as_bytes())
+                .unwrap();
+
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            archive
+                .append_data(&mut header, "package", std::io::empty())
+                .unwrap();
+            if requirement.name == "app" {
+                // Omit the oversized payload body to keep the fixture small.
+                // Planning must finish without inspecting or expanding it.
+                header.set_path("package/huge").unwrap();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(2 * 1024 * 1024 * 1024 + 1);
+                header.set_cksum();
+                archive.append(&header, std::io::empty()).unwrap();
+            }
+            archive.into_inner().unwrap().finish().unwrap();
+            Ok(file)
+        })
+        .unwrap();
+
+        let names: Vec<_> = plan
+            .iter()
+            .map(|package| package.metadata.name.as_str())
+            .collect();
+        assert_eq!(names, ["lib", "app"]);
+        assert!(database.read_installed_packages().unwrap().is_empty());
+
+        // Even with a valid dependency first, reject the invalid application
+        // before installing any package from the plan.
+        let error = validate_install_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("entry limit"));
+        assert!(database.read_installed_packages().unwrap().is_empty());
+
+        // The installer independently retains its full archive validation.
+        let logger = Logger::new(temp.path());
+        logger.init().unwrap();
+        let mut installer =
+            Installer::new(&database, &logger, PromptHandler::new(true, false, false));
+        let error = installer
+            .install(plan.last().unwrap().archive.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("entry limit"));
+        assert!(database.read_installed_packages().unwrap().is_empty());
     }
 
     #[test]
