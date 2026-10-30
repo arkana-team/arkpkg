@@ -65,7 +65,7 @@ fn run() -> Result<()> {
         }
         Commands::Info { package_name } => {
             let info = db.read_arkinfo(&package_name)?;
-            println!("{}", info.to_string_pretty());
+            println!("{}", info.to_terminal_string());
         }
         Commands::List => {
             let installed = db.read_installed_packages()?;

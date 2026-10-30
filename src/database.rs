@@ -183,48 +183,73 @@ impl ArkInfo {
 
     /// Serializes `.arkinfo` to plain text format.
     pub fn to_string_pretty(&self) -> String {
+        self.format_values(|value| value.to_string())
+    }
+
+    /// Formats metadata for terminal display, escaping controls within values.
+    /// Use `to_string_pretty` for persistent metadata instead.
+    pub fn to_terminal_string(&self) -> String {
+        self.format_values(|value| {
+            let value = value.to_string();
+            let mut escaped = String::with_capacity(value.len());
+            for character in value.chars() {
+                if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                    escaped.extend(character.escape_default());
+                } else {
+                    escaped.push(character);
+                }
+            }
+            escaped
+        })
+    }
+
+    fn format_values(&self, value: impl Fn(&dyn std::fmt::Display) -> String) -> String {
         let mut out = String::new();
-        out.push_str(&format!("Name: {}\n", self.name));
-        out.push_str(&format!("Version: {}\n", self.version));
-        out.push_str(&format!("Arch: {}\n", self.arch));
-        out.push_str(&format!("InstalledAt: {}\n", self.installed_at));
-        out.push_str(&format!("Checksum: {}\n", self.checksum));
+        out.push_str(&format!("Name: {}\n", value(&self.name)));
+        out.push_str(&format!("Version: {}\n", value(&self.version)));
+        out.push_str(&format!("Arch: {}\n", value(&self.arch)));
+        out.push_str(&format!("InstalledAt: {}\n", value(&self.installed_at)));
+        out.push_str(&format!("Checksum: {}\n", value(&self.checksum)));
 
         out.push_str("Files:\n");
         for f in &self.files {
-            out.push_str(&format!("{}\n", f.display()));
+            out.push_str(&format!("{}\n", value(&f.display())));
         }
 
         if !self.file_hashes.is_empty() {
             out.push_str("FileHashes:\n");
             for (path, hash) in &self.file_hashes {
-                out.push_str(&format!("{}:{}\n", path.display(), hash));
+                out.push_str(&format!("{}:{}\n", value(&path.display()), value(hash)));
             }
         }
 
         if !self.preserved_files.is_empty() {
             out.push_str("PreservedFiles:\n");
             for (original, backup) in &self.preserved_files {
-                out.push_str(&format!("{}={}\n", original.display(), backup.display()));
+                out.push_str(&format!(
+                    "{}={}\n",
+                    value(&original.display()),
+                    value(&backup.display())
+                ));
             }
         }
 
         if !self.dependencies.is_empty() {
             out.push_str("Dependencies:\n");
             for dependency in &self.dependencies {
-                out.push_str(&format!("{}\n", dependency));
+                out.push_str(&format!("{}\n", value(dependency)));
             }
         }
         if !self.provides.is_empty() {
             out.push_str("Provides:\n");
             for p in &self.provides {
-                out.push_str(&format!("{}\n", p));
+                out.push_str(&format!("{}\n", value(p)));
             }
         }
         if !self.conflicts.is_empty() {
             out.push_str("Conflicts:\n");
             for conflict in &self.conflicts {
-                out.push_str(&format!("{}\n", conflict));
+                out.push_str(&format!("{}\n", value(conflict)));
             }
         }
 
@@ -687,6 +712,56 @@ impl Database {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn terminal_info_preserves_printable_metadata_and_layout() {
+        let content = format!(
+            concat!(
+                "Name: sample\nVersion: 1.0\nArch: any\n",
+                "InstalledAt: 2026-10-28T00:00:00Z\nChecksum: {}\n",
+                "Files:\n/usr/bin/café\nFileHashes:\n/usr/bin/café:{}\n",
+                "PreservedFiles:\n/usr/bin/café=/usr/bin/café.backup\n",
+                "Dependencies:\nother>=1.0\nProvides:\n",
+                "feature=/usr/bin/café 'tool' \\name\nalias\nConflicts:\nold\n"
+            ),
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        let info = ArkInfo::parse(&content).unwrap();
+        assert_eq!(info.to_string_pretty(), content);
+        assert_eq!(info.to_terminal_string(), content);
+    }
+
+    #[test]
+    fn terminal_info_escapes_all_controls_within_values() {
+        let mut info =
+            ArkInfo::parse("Name: sample\nVersion: 1.0\nProvides:\nfeature=/usr/bin/tool\n")
+                .unwrap();
+        let lines = info.to_terminal_string().lines().count();
+        let controls: String = ('\u{0}'..='\u{1f}')
+            .chain('\u{7f}'..='\u{9f}')
+            .chain(['\u{2028}', '\u{2029}'])
+            .collect();
+        info.provides[0].path = format!("/usr/bin/{controls}tool");
+        let result = info.to_terminal_string();
+        assert!(!result.chars().any(|ch| ch.is_control() && ch != '\n'));
+        assert!(!result.contains(['\u{2028}', '\u{2029}']));
+        assert_eq!(result.lines().count(), lines);
+        for escaped in [
+            r"\u{0}",
+            r"\t",
+            r"\n",
+            r"\r",
+            r"\u{1b}",
+            r"\u{7f}",
+            r"\u{9b}",
+            r"\u{2028}",
+            r"\u{2029}",
+        ] {
+            assert!(result.contains(escaped), "missing {escaped}");
+        }
+        assert!(info.to_string_pretty().contains(&controls));
+    }
 
     #[cfg(unix)]
     #[test]
