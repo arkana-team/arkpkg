@@ -1213,6 +1213,7 @@ fn installer_rejects_repository_configuration_payloads() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn installer_rejects_repository_configurations_through_directory_aliases() {
     use std::os::unix::fs::symlink;
@@ -1278,7 +1279,11 @@ fn installer_matches_provided_features_case_insensitively() {
         archive
     };
 
-    let provider = build("Base", "Provides:\nShared-Lib=/usr/share/shared\n", "shared");
+    let provider = build(
+        "Base",
+        "Provides:\nShared-Lib=/usr/share/shared\n",
+        "shared",
+    );
     let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
     installer.install(&provider).unwrap();
 
