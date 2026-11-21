@@ -528,6 +528,9 @@ impl Database {
             writeln!(temp_file, "{} {}", n, v)?;
         }
         temp_file.flush()?;
+        // Flush file contents before the rename: without this a power loss can
+        // leave the new directory entry pointing at zero-length/partial data.
+        temp_file.as_file().sync_all()?;
         temp_file.replace("package.db").map_err(|error| {
             ArkError::Io(std::io::Error::other(format!(
                 "Failed to persist package.db: {error}"
@@ -549,13 +552,19 @@ impl Database {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            if let Some((path_str, pkg_name)) = trimmed.split_once('=') {
-                let path = PathBuf::from(path_str.trim());
-                let name = pkg_name.trim();
-                validate_installed_path(&path)?;
-                validate_package_name(name)?;
-                map.insert(path, name.to_string());
-            }
+            // A line that is not `path=owner` means the database is corrupt or
+            // was edited by hand. Silently skipping it would drop ownership
+            // records and let later installs/removals mis-handle those files.
+            let (path_str, pkg_name) = trimmed.split_once('=').ok_or_else(|| {
+                ArkError::InvalidPackage(format!(
+                    "Malformed file.db entry '{trimmed}': expected '<path>=<package>'"
+                ))
+            })?;
+            let path = PathBuf::from(path_str.trim());
+            let name = pkg_name.trim();
+            validate_installed_path(&path)?;
+            validate_package_name(name)?;
+            map.insert(path, name.to_string());
         }
         Ok(map)
     }
@@ -625,6 +634,7 @@ impl Database {
             writeln!(temp_file, "{}={}", path.display(), pkg)?;
         }
         temp_file.flush()?;
+        temp_file.as_file().sync_all()?;
         temp_file.replace("file.db").map_err(|error| {
             ArkError::Io(std::io::Error::other(format!(
                 "Failed to persist file.db: {error}"
@@ -648,6 +658,7 @@ impl Database {
         let mut temp_file = Self::temporary_file(&packages_dir)?;
         temp_file.write_all(arkinfo.to_string_pretty().as_bytes())?;
         temp_file.flush()?;
+        temp_file.as_file().sync_all()?;
         temp_file.replace(target_name).map_err(|error| {
             ArkError::Io(std::io::Error::other(format!(
                 "Failed to persist arkinfo: {error}"
@@ -1124,6 +1135,26 @@ mod tests {
         for content in invalid {
             assert!(ArkInfo::parse(&content).is_err());
         }
+    }
+
+    #[test]
+    fn malformed_file_database_lines_are_errors_instead_of_being_skipped() {
+        let root = TempDir::new().unwrap();
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        db.add_file_ownership(&[PathBuf::from("/usr/bin/owned")], "owner")
+            .unwrap();
+        let contents = fs::read_to_string(root.path().join("etc/arkpkg/file.db")).unwrap();
+        assert!(contents.contains("/usr/bin/owned=owner"));
+        let corrupted = format!("{contents}this line has no separator\n");
+        fs::write(root.path().join("etc/arkpkg/file.db"), corrupted).unwrap();
+
+        assert!(matches!(
+            db.read_file_ownership(),
+            Err(ArkError::InvalidPackage(message)) if message.contains("Malformed file.db entry")
+        ));
+        // Ownership lookups go through the same reader and must fail loudly.
+        assert!(db.get_file_owner("/usr/bin/owned").is_err());
     }
 
     #[test]
