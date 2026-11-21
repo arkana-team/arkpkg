@@ -166,9 +166,10 @@ embedded `ARKPKG` must match the index entry.
 Extraction only accepts `ARKPKG` and entries under `package/`, rejects absolute
 or `..` paths, duplicate entries, symlink ancestors, and non-file/dir/symlink
 entries. Installation resolves every parent component inside the target root and
-refuses to write through symlinks that escape it; pre-existing files are moved to
-sibling `.arkpkg-*` backups and restored on failure or removal. Package state
-lives in `etc/arkpkg/` and cannot be overwritten by payload files.
+refuses to write through symlinks that escape it; pre-existing files are moved
+to sibling temporary backups and restored on failure or removal. Package state
+lives in `etc/arkpkg/` (`package.db`, `file.db`, `packages/`, `repos.d/`) and
+payload files that would create or replace it are rejected.
 
 Repository publishing is separate: the external `arkpkg-repo` index builder
 currently requires `ARKPKG` metadata to be at most 64 KiB, well below the 1 MiB
@@ -204,3 +205,15 @@ same root at once.
 
 Background reading on the design:
 <https://debarkak.xyz/notes/arkanaos-package-manager/>.
+
+## Command-line behaviour notes
+
+* `arkpkg install <name>` prints the full download plan (the requested package
+  plus every dependency) and asks for confirmation before it installs anything.
+  Use `-y` to skip the prompt in scripts, `-n` to preview and decline.
+* Returning a different exit code per failure class (see above) is deliberate:
+  scripts can distinguish "not found" from "verification failed" without parsing
+  stderr.
+* `arkpkg search` prints installed matches first, then repository matches as
+  `<name> <version> [<arch>] (<repository>) - <description>`. Repository text is
+  control-character-escaped before printing.

@@ -40,14 +40,16 @@ fn run() -> Result<()> {
             } else {
                 let catalog = repositories.catalog(repo.as_deref())?;
                 let plan = resolve_install_plan(&db, &catalog, &package)?;
-                if plan.len() > 1 {
-                    println!("The following packages will be installed:");
-                    for resolved in &plan {
-                        println!("  {} {}", resolved.metadata.name, resolved.metadata.version);
-                    }
-                    if !prompt.ask("Install this package and its dependencies?")? {
-                        return Err(arkpkg::errors::ArkError::UserCancelled);
-                    }
+                // The plan is fetched, verified and installed in one run, so
+                // always show what is about to be written (a single package is
+                // not "nothing to confirm"). The prompt itself is skipped for
+                // -y/--force and answered No by -n.
+                println!("The following packages will be installed:");
+                for resolved in &plan {
+                    println!("  {} {}", resolved.metadata.name, resolved.metadata.version);
+                }
+                if !prompt.ask("Install this package and its dependencies?")? {
+                    return Err(arkpkg::errors::ArkError::UserCancelled);
                 }
                 let mut installer = Installer::new(&db, &logger, prompt);
                 for resolved in plan {
