@@ -81,10 +81,14 @@ impl<'a> Installer<'a> {
                     satisfied = true;
                     break;
                 }
-                // Check if installed package provides the required feature
+                // Check if installed package provides the required feature.
+                // Package-name matching above and the resolver both compare
+                // names case-insensitively; compares the same way here so a
+                // local `install` of an archive and a repository install agree
+                // on whether an existing provider satisfies the dependency.
                 if let Ok(inst_arkinfo) = self.db.read_arkinfo(inst_name) {
                     for provide in &inst_arkinfo.provides {
-                        if provide.name == dep_req.name
+                        if provide.name.eq_ignore_ascii_case(&dep_req.name)
                             && dep_req.is_satisfied_by(&inst_arkinfo.version)
                         {
                             satisfied = true;
@@ -505,30 +509,31 @@ fn resolve_destination(root: &Path, relative: &Path, create_parent: bool) -> Res
 /// Reject resolved destinations that overlap package-manager state, including
 /// paths that reach it through supported in-root directory symlinks.
 fn validate_database_destination(root: &Path, destination: &Path) -> Result<()> {
-    for relative in [
-        "etc/arkpkg/package.db",
-        "etc/arkpkg/file.db",
-        "etc/arkpkg/packages",
-    ] {
+    for relative in crate::database::RESERVED_STATE_PATHS {
         let mut reserved = resolve_destination(root, Path::new(relative), false)?;
-        if relative == "etc/arkpkg/packages" {
+        // These parent directories may legitimately be symlinks inside the root
+        // (e.g. a `packages/` alias onto shared config), so compare canonical
+        // paths. `package.db`/`file.db` are files and cannot be canonicalised
+        // before they exist; comparing the resolved parent plus file name is
+        // enough because their parent has already been checked.
+        if matches!(relative, "etc/arkpkg/packages" | "etc/arkpkg/repos.d") {
             match fs::symlink_metadata(&reserved) {
                 Ok(_) => {
                     reserved = reserved.canonicalize().map_err(|error| {
                         ArkError::InvalidPackage(format!(
-                            "Reserved package metadata path cannot be resolved: {error}"
+                            "Reserved package state path '{relative}' cannot be resolved: {error}"
                         ))
                     })?;
                     if !reserved.starts_with(root) {
                         return Err(ArkError::InvalidPackage(format!(
-                            "Reserved package metadata path '{}' resolves outside the target root",
+                            "Reserved package state path '{}' resolves outside the target root",
                             reserved.display()
                         )));
                     }
                     if !reserved.is_dir() {
-                        return Err(ArkError::InvalidPackage(
-                            "Reserved package metadata path is not a directory".into(),
-                        ));
+                        return Err(ArkError::InvalidPackage(format!(
+                            "Reserved package state path '{relative}' is not a directory"
+                        )));
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
