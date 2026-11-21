@@ -337,14 +337,24 @@ fn validate_preserved_files(
     Ok(())
 }
 
+/// Package-manager state that package payloads must never create or replace.
+///
+/// `etc/arkpkg` is deliberately absent: the directory itself is shared state and
+/// is covered by the individual entries. Keeping the list here means the
+/// install-time checks and the database helpers cannot drift apart.
+pub(crate) const RESERVED_STATE_PATHS: [&str; 4] = [
+    "etc/arkpkg/package.db",
+    "etc/arkpkg/file.db",
+    "etc/arkpkg/packages",
+    // Repository definitions are trusted input for HTTPS fetches; an installed
+    // package must not be able to add `repos.d/<name>.json` by shipping it.
+    "etc/arkpkg/repos.d",
+];
+
 /// Reject payload paths that cannot be recorded losslessly or overlap database state.
 pub(crate) fn validate_payload_path(relative: &Path) -> Result<()> {
     validate_installed_path(&Path::new("/").join(relative))?;
-    for reserved in [
-        "etc/arkpkg/package.db",
-        "etc/arkpkg/file.db",
-        "etc/arkpkg/packages",
-    ] {
+    for reserved in RESERVED_STATE_PATHS {
         let reserved = Path::new(reserved);
         if relative.starts_with(reserved) || reserved.starts_with(relative) {
             return Err(ArkError::InvalidPackage(format!(
@@ -726,6 +736,8 @@ mod tests {
             "etc/arkpkg/file.db",
             "etc/arkpkg/packages",
             "etc/arkpkg/packages/sample.arkinfo",
+            "etc/arkpkg/repos.d",
+            "etc/arkpkg/repos.d/main.json",
         ] {
             assert!(
                 validate_payload_path(Path::new(path)).is_err(),
