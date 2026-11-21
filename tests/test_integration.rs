@@ -1252,3 +1252,38 @@ fn installer_rejects_repository_configurations_through_directory_aliases() {
         0
     );
 }
+
+#[test]
+fn installer_matches_provided_features_case_insensitively() {
+    // Package names are matched case-insensitively everywhere else (and
+    // validate_package_name accepts mixed case), but the install-time
+    // dependency check compared provided feature names byte-exactly.
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+
+    let build = |name: &str, extra: &str, file: &str| {
+        let source = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            format!("Name: {name}\nDescription: case test\nVersion: 1.0\nArch: any\n{extra}"),
+        )
+        .unwrap();
+        let payload = source.path().join("package/usr/share").join(file);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, name).unwrap();
+        let archive = output.path().join(format!("{name}.ark"));
+        create_ark(source.path(), &archive).unwrap();
+        archive
+    };
+
+    let provider = build("Base", "Provides:\nShared-Lib=/usr/share/shared\n", "shared");
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&provider).unwrap();
+
+    let consumer = build("App", "Dependencies:\nshared-lib>=1.0\n", "app");
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&consumer).unwrap();
+    assert!(db.is_installed("app").unwrap().is_some());
+}

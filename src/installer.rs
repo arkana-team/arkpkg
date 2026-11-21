@@ -81,10 +81,14 @@ impl<'a> Installer<'a> {
                     satisfied = true;
                     break;
                 }
-                // Check if installed package provides the required feature
+                // Check if installed package provides the required feature.
+                // Package-name matching above and the resolver both compare
+                // names case-insensitively; compares the same way here so a
+                // local `install` of an archive and a repository install agree
+                // on whether an existing provider satisfies the dependency.
                 if let Ok(inst_arkinfo) = self.db.read_arkinfo(inst_name) {
                     for provide in &inst_arkinfo.provides {
-                        if provide.name == dep_req.name
+                        if provide.name.eq_ignore_ascii_case(&dep_req.name)
                             && dep_req.is_satisfied_by(&inst_arkinfo.version)
                         {
                             satisfied = true;
