@@ -464,6 +464,7 @@ impl Database {
         let file = Self::open_database_file(&db_dir, "package.db", false)?;
         let reader = BufReader::new(file);
         let mut list = Vec::new();
+        let mut names = HashSet::new();
 
         for line in reader.lines() {
             let l = line?;
@@ -484,6 +485,11 @@ impl Database {
                 ));
             }
             validate_package_name(name)?;
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Duplicate package database entry for '{name}'"
+                )));
+            }
             list.push((name.to_string(), Version::parse(version)?));
         }
         Ok(list)
