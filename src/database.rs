@@ -564,6 +564,12 @@ impl Database {
             let name = pkg_name.trim();
             validate_installed_path(&path)?;
             validate_package_name(name)?;
+            if map.contains_key(&path) {
+                return Err(ArkError::InvalidPackage(format!(
+                    "Duplicate file.db entry for path '{}'",
+                    path.display()
+                )));
+            }
             map.insert(path, name.to_string());
         }
         Ok(map)
