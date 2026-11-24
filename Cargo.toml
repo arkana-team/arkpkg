@@ -1,10 +1,14 @@
 [workspace]
 members = ["."]
 
+# Keep this in sync with the `rust` image tag in `Dockerfile` and with
+# `rust-version` below. CI builds inside that image, so a stale pin silently
+# leaves the project on an old compiler (and breaks once the tag is unpublished).
 [package]
 name = "arkpkg"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.99"
 authors = ["arkanaOS Team"]
 description = "Official package manager for arkanaOS"
 license = "GPL-3.0"
@@ -35,8 +39,6 @@ tempfile = "3.20"
 rustix = { version = "1.1", features = ["fs"] }
 rustix-linux-procfs = "0.1.1"
 chrono = "0.4"
-log = "0.4"
-simplelog = "0.12"
 thiserror = "1.0"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2.5"

@@ -1175,3 +1175,120 @@ fn verifier_requires_expected_hashes_for_success() {
         assert_eq!(fs::read_to_string(&metadata_path).unwrap(), metadata);
     }
 }
+
+#[test]
+fn installer_rejects_repository_configuration_payloads() {
+    // `etc/arkpkg/repos.d` was missing from the reserved-state lists, so a
+    // package could ship a repository definition and have `arkpkg` fetch from
+    // it later without any repository add consent.
+    for relative in ["etc/arkpkg/repos.d/evil.json", "etc/arkpkg"] {
+        let source = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let output = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            "Name: repohijack\nDescription: reserved repository state test\nVersion: 1.0\nArch: any\n",
+        )
+        .unwrap();
+        let payload = source.path().join("package").join(relative);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"{}").unwrap();
+        let archive = output.path().join("attack.ark");
+        create_ark(source.path(), &archive).unwrap();
+
+        let db = Database::new(root.path());
+        db.init().unwrap();
+        let logger = Logger::new(root.path());
+        let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+        assert!(
+            matches!(
+                installer.install(&archive),
+                Err(ArkError::InvalidPackage(_))
+            ),
+            "accepted payload {relative}"
+        );
+        assert!(!root.path().join("etc/arkpkg/repos.d").exists());
+        assert!(db.is_installed("repohijack").unwrap().is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_rejects_repository_configurations_through_directory_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let source = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    fs::create_dir_all(root.path().join("etc/arkpkg")).unwrap();
+    fs::create_dir_all(root.path().join("config/repos")).unwrap();
+    // An administrator-created in-root alias is supported for `packages/`, so
+    // the same guard has to cover `repos.d` through that alias.
+    symlink("../../config/repos", root.path().join("etc/arkpkg/repos.d")).unwrap();
+    fs::write(
+        source.path().join("ARKPKG"),
+        "Name: repoalias\nDescription: reserved repository alias test\nVersion: 1.0\nArch: any\n",
+    )
+    .unwrap();
+    let payload = source.path().join("package/config/repos/evil.json");
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(&payload, b"{}").unwrap();
+    let archive = output.path().join("attack.ark");
+    create_ark(source.path(), &archive).unwrap();
+
+    let db = Database::new(root.path());
+    db.init().unwrap();
+    let logger = Logger::new(root.path());
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, true));
+
+    assert!(matches!(
+        installer.install(&archive),
+        Err(ArkError::InvalidPackage(_))
+    ));
+    assert_eq!(
+        fs::read_dir(root.path().join("config/repos"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn installer_matches_provided_features_case_insensitively() {
+    // Package names are matched case-insensitively everywhere else (and
+    // validate_package_name accepts mixed case), but the install-time
+    // dependency check compared provided feature names byte-exactly.
+    let root = TempDir::new().unwrap();
+    let output = TempDir::new().unwrap();
+    let db = Database::new(root.path());
+    let logger = Logger::new(root.path());
+
+    let build = |name: &str, extra: &str, file: &str| {
+        let source = TempDir::new().unwrap();
+        fs::write(
+            source.path().join("ARKPKG"),
+            format!("Name: {name}\nDescription: case test\nVersion: 1.0\nArch: any\n{extra}"),
+        )
+        .unwrap();
+        let payload = source.path().join("package/usr/share").join(file);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, name).unwrap();
+        let archive = output.path().join(format!("{name}.ark"));
+        create_ark(source.path(), &archive).unwrap();
+        archive
+    };
+
+    let provider = build(
+        "Base",
+        "Provides:\nShared-Lib=/usr/share/shared\n",
+        "shared",
+    );
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&provider).unwrap();
+
+    let consumer = build("App", "Dependencies:\nshared-lib>=1.0\n", "app");
+    let mut installer = Installer::new(&db, &logger, PromptHandler::new(true, false, false));
+    installer.install(&consumer).unwrap();
+    assert!(db.is_installed("app").unwrap().is_some());
+}
